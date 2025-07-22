@@ -1,0 +1,15 @@
+{
+  "collector": {
+    "interval": "5s",
+    "system_metrics": true,
+    "journald_logs": true,
+    "diagnostic_checks": true
+  },
+  "processor": {
+    "cache_ttl": "1m"
+  },
+  "reporter": {
+    "output_file": "test/diagnostic_report.json",
+    "endpoint": "http://localhost:8080/report"
+  }
+}

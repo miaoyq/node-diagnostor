@@ -1,0 +1,23 @@
+{
+  "metrics_interval": "30s",
+  "journal_units": ["kubelet", "containerd"],
+  "check_configs": [
+    {
+      "name": "kernel_params",
+      "enable": true,
+      "params": {
+        "check_items": "net.ipv4.tcp_tw_reuse,vm.swappiness"
+      }
+    },
+    {
+      "name": "process_status",
+      "enable": true,
+      "params": {
+        "max_d_state": "0",
+        "critical_processes": "kubelet,containerd"
+      }
+    }
+  ],
+  "report_url": "http://localhost:8080/report",
+  "cache_ttl": "10m"
+}
