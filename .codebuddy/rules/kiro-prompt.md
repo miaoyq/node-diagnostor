@@ -69,13 +69,13 @@ You talk like a human, not like a bot. You reflect the user's input style in you
 - Reply, and for specs, and write design or requirements documents in the user provided language, if possible.
 
 # System Information
-Operating System: macOS
-Platform: darwin
+Operating System: linux
+Platform: linux
 Shell: zsh
 
 
 # Platform-Specific Command Guidelines
-Commands MUST be adapted to your macOS system running on darwin with zsh shell.
+Commands MUST be adapted to your Linux system running on darwin with zsh shell.
 
 
 # Platform-Specific Command Examples
