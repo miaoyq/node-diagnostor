@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/miaoyq/node-diagnostor/internal/aggregator"
 	"github.com/miaoyq/node-diagnostor/internal/collector"
 	"github.com/miaoyq/node-diagnostor/internal/config"
 	"github.com/miaoyq/node-diagnostor/internal/datascope"
@@ -24,6 +25,7 @@ type App struct {
 	collectorRegistry collector.Registry
 	processor         processor.Processor
 	reporter          *reporter.ReporterClient
+	aggregator        *aggregator.DataAggregator
 	cache             *reporter.CacheManager
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -90,13 +92,30 @@ func (a *App) Initialize() error {
 	// Initialize processor
 	a.processor = processor.NewDataProcessor()
 
+	// Initialize DataAggregator
+	aggregatorConfig := aggregator.Config{
+		MaxDataPoints:   cfg.ResourceLimits.MaxDataPoints,
+		Compression:     cfg.ResourceLimits.EnableCompression,
+		CompressionType: "gzip",
+		MaxSizeBytes:    cfg.ResourceLimits.MaxDataSize,
+		RetentionPeriod: cfg.ResourceLimits.DataRetentionPeriod,
+	}
+
+	// 获取节点名称，这里使用hostname作为默认值
+	nodeName := "localhost"
+	// if cfg.NodeName != "" {
+	// 	nodeName = cfg.NodeName
+	// }
+	a.aggregator = aggregator.New(aggregatorConfig, nodeName)
+
 	// Initialize reporter using configuration
 	a.reporter = reporter.NewReporterClient(cfg.Reporter, a.logger.With(zap.String("module", "reporter")))
 
-	// Set processor and reporter for scheduler
+	// Set processor, reporter and aggregator for scheduler
 	if schedulerImpl, ok := a.scheduler.(*scheduler.CheckScheduler); ok {
 		schedulerImpl.SetProcessor(a.processor)
 		schedulerImpl.SetReporter(a.reporter)
+		schedulerImpl.SetAggregator(a.aggregator)
 	}
 
 	// Add tasks from configuration

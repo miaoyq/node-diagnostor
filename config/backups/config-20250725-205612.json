@@ -3,7 +3,7 @@
   "checks": [
     {
       "name": "system_health",
-      "interval": 10000000000,
+      "interval": "10s",
       "collectors": ["cpu", "memory", "disk", "network"],
       "params": {
         "cpu_threshold": 80,
@@ -12,41 +12,43 @@
       },
       "mode": "仅本地",
       "enabled": true,
-      "timeout": 30000000000,
+      "timeout": "30s",
       "priority": 1
     },
     {
-      "name": "system_load",
-      "interval": 15000000000,
-      "collectors": ["system-load"],
-      "params": {},
+      "name": "process_monitor",
+      "interval": "15s",
+      "collectors": ["process"],
+      "params": {
+        "target_processes": ["kubelet", "containerd", "dockerd"]
+      },
       "mode": "仅本地",
       "enabled": true,
-      "timeout": 20000000000,
+      "timeout": "20s",
       "priority": 2
     },
     {
-      "name": "kernel_log",
-      "interval": 30000000000,
-      "collectors": ["kernel-log"],
+      "name": "kernel_check",
+      "interval": "30s",
+      "collectors": ["kernel"],
       "params": {
         "check_sysctl": ["net.ipv4.tcp_tw_reuse", "vm.swappiness"],
         "check_dmesg": true
       },
       "mode": "仅本地",
       "enabled": true,
-      "timeout": 15000000000,
+      "timeout": "15s",
       "priority": 3
     }
   ],
   "resource_limits": {
     "max_cpu_percent": 10.0,
     "max_memory_mb": 50,
-    "min_interval": 10000000000,
+    "min_interval": "10s",
     "max_concurrent": 2,
     "max_data_points": 1000,
     "max_data_size": 10485760,
-    "data_retention_period": 3600000000000,
+    "data_retention_period": "1h",
     "enable_compression": true
   },
   "data_scope": {
@@ -57,11 +59,11 @@
   },
   "reporter": {
     "endpoint": "http://localhost:8088/api/v1/diagnostics",
-    "timeout": 10000000000,
+    "timeout": "10s",
     "max_retries": 3,
-    "retry_delay": 5000000000,
+    "retry_delay": "5s",
     "compression": true,
     "cache_max_size": 5242880,
-    "cache_max_age": 3600000000000
+    "cache_max_age": "1h"
   }
 }

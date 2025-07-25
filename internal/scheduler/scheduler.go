@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miaoyq/node-diagnostor/internal/aggregator"
+	"github.com/miaoyq/node-diagnostor/internal/collector"
 	"github.com/miaoyq/node-diagnostor/internal/config"
 	"github.com/miaoyq/node-diagnostor/internal/processor"
 	"github.com/miaoyq/node-diagnostor/internal/reporter"
@@ -98,6 +100,12 @@ type Scheduler interface {
 	// SetMaxConcurrent sets the maximum number of concurrent executions
 	SetMaxConcurrent(maxConcurrent int)
 
+	// SetProcessor sets the data processor
+	SetProcessor(processor processor.Processor)
+
+	// SetReporter sets the data reporter
+	SetReporter(reporter *reporter.ReporterClient)
+
 	// OnConfigUpdate add ConfigSubscriber interface implementation for scheduler
 	OnConfigUpdate(newConfig *config.Config) error
 }
@@ -129,7 +137,7 @@ type Monitor interface {
 	GetTaskMetrics(taskID string) map[string]interface{}
 }
 
-// CheckScheduler implements the Scheduler interface with fixed cycle scheduling
+// CheckScheduler implements the Scheduler interface
 type CheckScheduler struct {
 	mu            sync.RWMutex
 	tasks         map[string]*Task
@@ -143,23 +151,21 @@ type CheckScheduler struct {
 	wg            sync.WaitGroup
 	maxConcurrent int
 	semaphore     chan struct{}
-	taskTimers    map[string]*time.Timer   // 新增：任务定时器映射
-	processor     processor.Processor      // 新增：数据处理器
-	reporter      *reporter.ReporterClient // 新增：数据上报器
+	taskTimers    map[string]*time.Timer     // 新增：任务定时器映射
+	processor     processor.Processor        // 新增：数据处理器
+	reporter      *reporter.ReporterClient   // 新增：数据上报器
+	aggregator    *aggregator.DataAggregator // 新增：数据聚合器
 }
 
 // New creates a new CheckScheduler instance
 func New(executor Executor, monitor Monitor, logger *zap.Logger) *CheckScheduler {
-	if monitor == nil {
-		monitor = NewTaskMonitor()
-	}
 	return &CheckScheduler{
 		tasks:         make(map[string]*Task),
 		taskQueue:     NewPriorityQueue(),
 		executor:      executor,
 		monitor:       monitor,
 		logger:        logger,
-		maxConcurrent: 1, // Default to 1 concurrent execution
+		maxConcurrent: 1,
 		semaphore:     make(chan struct{}, 1),
 		taskTimers:    make(map[string]*time.Timer),
 	}
@@ -173,6 +179,11 @@ func (cs *CheckScheduler) SetProcessor(processor processor.Processor) {
 // SetReporter sets the data reporter
 func (cs *CheckScheduler) SetReporter(reporter *reporter.ReporterClient) {
 	cs.reporter = reporter
+}
+
+// SetAggregator sets the data aggregator
+func (cs *CheckScheduler) SetAggregator(aggregator *aggregator.DataAggregator) {
+	cs.aggregator = aggregator
 }
 
 // Add adds a new task to the scheduler
@@ -513,7 +524,66 @@ func (cs *CheckScheduler) processAndReportData(ctx context.Context, task *Task, 
 		return
 	}
 
-	// Process the collected data
+	// 尝试从结果中提取collector结果
+	var collectorResults []*collector.Result
+
+	// 处理不同类型的结果数据
+	switch v := result.(type) {
+	case map[string]interface{}:
+		// 从scheduler executor的结果中提取
+		if results, ok := v["results"].([]*collector.Result); ok {
+			collectorResults = results
+		} else {
+			// 单个结果的情况
+			collectorResults = []*collector.Result{
+				{
+					Data: &collector.Data{
+						Type:      task.Collector,
+						Timestamp: time.Now(),
+						Source:    task.Collector,
+						Data:      v,
+						Metadata:  make(map[string]string),
+					},
+					Error:   nil,
+					Skipped: false,
+				},
+			}
+		}
+	default:
+		// 处理其他类型的结果
+		collectorResults = []*collector.Result{
+			{
+				Data: &collector.Data{
+					Type:      task.Collector,
+					Timestamp: time.Now(),
+					Source:    task.Collector,
+					Data:      map[string]interface{}{"raw": v},
+					Metadata:  make(map[string]string),
+				},
+				Error:   nil,
+				Skipped: false,
+			},
+		}
+	}
+
+	// 使用DataAggregator聚合数据
+	if cs.aggregator != nil && len(collectorResults) > 0 {
+		aggregatedData, err := cs.aggregator.Aggregate(ctx, task.Name, collectorResults)
+		if err != nil {
+			cs.logger.Error("Failed to aggregate data", zap.Error(err))
+			// 如果聚合失败，继续使用原始数据
+		} else {
+			// 使用聚合后的数据
+			result = map[string]interface{}{
+				"aggregated": aggregatedData,
+				"task_name":  task.Name,
+				"task_id":    task.ID,
+				"timestamp":  time.Now(),
+			}
+		}
+	}
+
+	// Process the collected/aggregated data
 	processedData, err := cs.processor.Process(ctx, result)
 	if err != nil {
 		cs.logger.Error("Failed to process data", zap.Error(err))

@@ -27,10 +27,14 @@ type CheckConfig struct {
 
 // ResourceLimits 资源限制配置
 type ResourceLimits struct {
-	MaxCPU        float64       `json:"max_cpu_percent"` // 最大CPU使用率：5%
-	MaxMemory     int64         `json:"max_memory_mb"`   // 最大内存使用：100MB
-	MinInterval   time.Duration `json:"min_interval"`    // 最小检查间隔：1分钟
-	MaxConcurrent int           `json:"max_concurrent"`  // 最大并发检查数：1（顺序执行）
+	MaxCPU              float64       `json:"max_cpu_percent"`       // 最大CPU使用率：5%
+	MaxMemory           int64         `json:"max_memory_mb"`         // 最大内存使用：100MB
+	MinInterval         time.Duration `json:"min_interval"`          // 最小检查间隔：1分钟
+	MaxConcurrent       int           `json:"max_concurrent"`        // 最大并发检查数：1（顺序执行）
+	MaxDataPoints       int           `json:"max_data_points"`       // 最大数据点数
+	MaxDataSize         int           `json:"max_data_size"`         // 最大数据大小（字节）
+	DataRetentionPeriod time.Duration `json:"data_retention_period"` // 数据保留期
+	EnableCompression   bool          `json:"enable_compression"`    // 是否启用压缩
 }
 
 // DataScopeConfig 数据范围配置

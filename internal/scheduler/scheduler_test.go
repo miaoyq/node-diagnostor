@@ -338,6 +338,7 @@ func TestSchedulerStatus(t *testing.T) {
 	scheduler := New(executor, monitor, logger)
 
 	executor.On("Execute", mock.Anything, mock.Anything).Return(&Result{}, nil)
+	monitor.On("Record", mock.Anything, mock.Anything).Return(nil)
 
 	// Test stopped status
 	status := scheduler.GetStatus()

@@ -126,8 +126,8 @@ func (e *CheckExecutor) SetConcurrencyLimit(limit int) error {
 func (e *CheckExecutor) getCollectorsForTask(task *Task) []collector.Collector {
 	var collectors []collector.Collector
 
-	// Use task name as collector name
-	if coll, err := e.registry.Get(task.Name); err == nil {
+	// Use task collector name
+	if coll, err := e.registry.Get(task.Collector); err == nil {
 		collectors = append(collectors, coll)
 	}
 
