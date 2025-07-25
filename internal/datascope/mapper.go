@@ -36,7 +36,7 @@ type Mapper struct {
 
 // NewMapper creates a new data type mapper
 func NewMapper() *Mapper {
-	return &Mapper{
+	m := &Mapper{
 		nodeLocalTypes:    make(map[string]DataTypeInfo),
 		clusterLevelTypes: make(map[string]DataTypeInfo),
 		supplementTypes:   make(map[string]DataTypeInfo),
@@ -44,6 +44,10 @@ func NewMapper() *Mapper {
 		blackList:         make(map[string]bool),
 		cache:             make(map[string]DataType),
 	}
+
+	// Initialize data type mappings
+	m.Initialize()
+	return m
 }
 
 // Initialize loads the predefined data type mappings

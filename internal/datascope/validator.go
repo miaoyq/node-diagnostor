@@ -3,192 +3,255 @@ package datascope
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
-// DataTypeValidator 数据类型验证器，专门用于验证采集器类型和提供详细的跳过原因
+// ValidationResult represents the result of validating a single collector
+type ValidationResult struct {
+	Collector  string
+	IsValid    bool
+	Category   string
+	Reason     string
+	Suggestion string
+	Metadata   map[string]interface{}
+}
+
+// CheckValidationResult represents the result of validating a check configuration
+type CheckValidationResult struct {
+	CheckName  string
+	Valid      bool
+	Mode       string
+	Collectors []ValidationResult
+	Errors     []string
+	Stats      ValidationStats
+}
+
+// ValidationStats contains statistics about validation results
+type ValidationStats struct {
+	TotalCount      int
+	LocalCount      int
+	SupplementCount int
+	SkipCount       int
+	UnknownCount    int
+}
+
+// ValidationReport contains comprehensive validation results
+type ValidationReport struct {
+	Mode         string
+	TotalChecks  int
+	Results      map[string]*CheckValidationResult
+	OverallStats ValidationStats
+}
+
+// DataTypeValidator validates collector configurations based on data scope
 type DataTypeValidator struct {
 	checker *DataScopeChecker
+	mapper  *Mapper
+	cache   map[string]*ValidationResult
+	mutex   sync.RWMutex
 }
 
-// ValidationResult 验证结果，包含详细的验证信息
-type ValidationResult struct {
-	IsValid      bool              // 是否有效
-	Collector    string            // 采集器名称
-	Category     string            // 数据类型分类
-	Reason       string            // 详细原因
-	Suggestion   string            // 建议操作
-	Alternatives []string          // 替代采集器
-	Metadata     map[string]string // 额外元数据
-}
-
-// NewDataTypeValidator 创建新的数据类型验证器
+// NewDataTypeValidator creates a new data type validator
 func NewDataTypeValidator(checker *DataScopeChecker) *DataTypeValidator {
 	return &DataTypeValidator{
 		checker: checker,
+		mapper:  NewMapper(),
+		cache:   make(map[string]*ValidationResult),
 	}
 }
 
-// ValidateCollector 验证单个采集器类型
+// ValidateCollector validates if a collector should run based on its data type
 func (v *DataTypeValidator) ValidateCollector(collector string) *ValidationResult {
+	v.mutex.RLock()
+	if cached, exists := v.cache[collector]; exists {
+		v.mutex.RUnlock()
+		return cached
+	}
+	v.mutex.RUnlock()
+
 	result := &ValidationResult{
 		Collector: collector,
-		Metadata:  make(map[string]string),
+		IsValid:   true,
+		Metadata:  make(map[string]interface{}),
 	}
 
-	// 检查是否为节点本地独有数据
-	if v.checker.IsNodeLocalType(collector) {
+	// Determine data type using mapper
+	dataType, err := v.mapper.GetDataType(collector)
+	if err != nil {
+		result.IsValid = true
+		result.Category = "unknown"
+		result.Reason = fmt.Sprintf("采集器 '%s' 是未知类型，默认作为节点本地数据处理", collector)
+		result.Suggestion = "建议确认该采集器的数据类型，或将其归类到合适的数据类型"
+		result.Metadata["scope"] = "unknown"
+		result.Metadata["priority"] = "low"
+		v.cacheResult(collector, result)
+		return result
+	}
+
+	switch dataType {
+	case NodeLocal:
 		result.IsValid = true
 		result.Category = "node_local"
 		result.Reason = fmt.Sprintf("采集器 '%s' 是节点本地独有数据类型，必须在本地采集", collector)
-		result.Suggestion = "可以直接使用此采集器"
-		result.Metadata["scope"] = "local"
+		result.Suggestion = "该采集器提供的数据无法通过集群监控获取，建议保留"
+		result.Metadata["scope"] = "node_local"
 		result.Metadata["priority"] = "high"
-		return result
-	}
-
-	// 检查是否为集群补充数据
-	if v.checker.IsSupplementType(collector) {
-		result.IsValid = true
-		result.Category = "cluster_supplement"
-		result.Reason = fmt.Sprintf("采集器 '%s' 是集群监控无法提供的补充数据，需要在本地采集", collector)
-		result.Suggestion = "在集群补充模式下使用此采集器"
-		result.Metadata["scope"] = "supplement"
-		result.Metadata["priority"] = "medium"
-		return result
-	}
-
-	// 检查是否为跳过采集的数据类型
-	if v.checker.IsSkipType(collector) {
+	case ClusterLevel:
 		result.IsValid = false
 		result.Category = "cluster_level"
 		result.Reason = fmt.Sprintf("采集器 '%s' 是集群级数据类型，已由集群监控覆盖，无需本地采集", collector)
-		result.Suggestion = "移除此采集器，依赖集群监控"
-		result.Alternatives = v.getLocalAlternatives(collector)
+		result.Suggestion = "建议移除该采集器，使用集群监控数据替代"
 		result.Metadata["scope"] = "cluster"
 		result.Metadata["priority"] = "skip"
-		return result
+	case ClusterSupplement:
+		result.IsValid = true
+		result.Category = "cluster_supplement"
+		result.Reason = fmt.Sprintf("采集器 '%s' 是集群监控无法提供的补充数据，需要在本地采集", collector)
+		result.Suggestion = "该采集器提供集群监控缺失的细节数据，建议保留"
+		result.Metadata["scope"] = "supplement"
+		result.Metadata["priority"] = "medium"
 	}
 
-	// 未知类型，默认作为节点本地处理
-	result.IsValid = true
-	result.Category = "unknown"
-	result.Reason = fmt.Sprintf("采集器 '%s' 是未知类型，默认作为节点本地数据处理", collector)
-	result.Suggestion = "确认此采集器是否确实需要本地采集"
-	result.Metadata["scope"] = "local"
-	result.Metadata["priority"] = "low"
-	result.Metadata["note"] = "unknown_type"
-
+	v.cacheResult(collector, result)
 	return result
 }
 
-// ValidateCollectors 验证多个采集器类型
-func (v *DataTypeValidator) ValidateCollectors(collectors []string) []*ValidationResult {
-	results := make([]*ValidationResult, 0, len(collectors))
-	for _, collector := range collectors {
-		results = append(results, v.ValidateCollector(collector))
+// ValidateCollectors validates multiple collectors
+func (v *DataTypeValidator) ValidateCollectors(collectors []string) []ValidationResult {
+	results := make([]ValidationResult, len(collectors))
+	for i, collector := range collectors {
+		results[i] = *v.ValidateCollector(collector)
 	}
 	return results
 }
 
-// ValidateCheckConfig 验证检查项配置
+// ValidateCheckConfig validates a complete check configuration
 func (v *DataTypeValidator) ValidateCheckConfig(checkName string, collectors []string, mode string) *CheckValidationResult {
 	result := &CheckValidationResult{
 		CheckName:  checkName,
 		Mode:       mode,
-		Valid:      true,
-		Collectors: make([]*ValidationResult, 0, len(collectors)),
+		Collectors: make([]ValidationResult, len(collectors)),
+		Errors:     []string{},
 	}
 
-	// 验证每个采集器
-	for _, collector := range collectors {
-		validation := v.ValidateCollector(collector)
-		result.Collectors = append(result.Collectors, validation)
+	var localCount, supplementCount, skipCount, unknownCount int
 
-		// 根据模式判断有效性
-		switch mode {
-		case "仅本地":
-			if !validation.IsValid || validation.Category != "node_local" {
-				result.Valid = false
-				result.Errors = append(result.Errors, fmt.Sprintf("仅本地模式下不允许使用非节点本地采集器: %s", collector))
-			}
-		case "集群补充":
-			if validation.Category == "cluster_level" {
-				result.Valid = false
-				result.Errors = append(result.Errors, fmt.Sprintf("集群补充模式下不允许使用集群级采集器: %s", collector))
-			}
+	for i, collector := range collectors {
+		validation := v.ValidateCollector(collector)
+		result.Collectors[i] = *validation
+
+		switch validation.Category {
+		case "node_local":
+			localCount++
+		case "cluster_supplement":
+			supplementCount++
+		case "cluster_level":
+			skipCount++
+		case "unknown":
+			unknownCount++
+		}
+
+		// Check mode-specific validation
+		if !v.isValidForMode(*validation, mode) {
+			errMsg := fmt.Sprintf("采集器 '%s' 不适合 %s 模式: %s", collector, mode, validation.Reason)
+			result.Errors = append(result.Errors, errMsg)
 		}
 	}
 
-	// 统计结果
-	result.Stats = v.calculateStats(result.Collectors)
+	result.Stats = ValidationStats{
+		TotalCount:      len(collectors),
+		LocalCount:      localCount,
+		SupplementCount: supplementCount,
+		SkipCount:       skipCount,
+		UnknownCount:    unknownCount,
+	}
 
-	// 生成建议
-	result.Suggestions = v.generateSuggestions(result, mode)
-
+	result.Valid = len(result.Errors) == 0
 	return result
 }
 
-// CheckValidationResult 检查项验证结果
-type CheckValidationResult struct {
-	CheckName   string              // 检查项名称
-	Mode        string              // 采集模式
-	Valid       bool                // 配置是否有效
-	Collectors  []*ValidationResult // 采集器验证结果
-	Errors      []string            // 配置错误
-	Stats       ValidationStats     // 统计信息
-	Suggestions []string            // 配置建议
+// isValidForMode checks if a validation result is valid for the given mode
+func (v *DataTypeValidator) isValidForMode(validation ValidationResult, mode string) bool {
+	switch mode {
+	case "仅本地":
+		return validation.Category == "node_local" || validation.Category == "unknown"
+	case "集群补充":
+		return validation.Category == "cluster_supplement" || validation.Category == "unknown"
+	case "自动选择":
+		return true // 自动选择模式下所有类型都有效
+	default:
+		return true
+	}
 }
 
-// ValidationStats 验证统计信息
-type ValidationStats struct {
-	TotalCount      int // 总采集器数量
-	LocalCount      int // 节点本地采集器数量
-	SupplementCount int // 集群补充采集器数量
-	SkipCount       int // 跳过采集器数量
-	UnknownCount    int // 未知类型采集器数量
-}
-
-// calculateStats 计算验证统计信息
-func (v *DataTypeValidator) calculateStats(results []*ValidationResult) ValidationStats {
-	stats := ValidationStats{
-		TotalCount: len(results),
+// GetValidationReport generates a comprehensive validation report
+func (v *DataTypeValidator) GetValidationReport(checks map[string][]string, mode string) *ValidationReport {
+	report := &ValidationReport{
+		Mode:        mode,
+		TotalChecks: len(checks),
+		Results:     make(map[string]*CheckValidationResult),
 	}
 
-	for _, result := range results {
-		switch result.Category {
-		case "node_local":
-			stats.LocalCount++
-		case "cluster_supplement":
-			stats.SupplementCount++
-		case "cluster_level":
-			stats.SkipCount++
-		case "unknown":
-			stats.UnknownCount++
-		}
+	var totalLocal, totalSupplement, totalSkip, totalUnknown int
+
+	for checkName, collectors := range checks {
+		result := v.ValidateCheckConfig(checkName, collectors, mode)
+		report.Results[checkName] = result
+
+		totalLocal += result.Stats.LocalCount
+		totalSupplement += result.Stats.SupplementCount
+		totalSkip += result.Stats.SkipCount
+		totalUnknown += result.Stats.UnknownCount
 	}
 
-	return stats
+	report.OverallStats = ValidationStats{
+		TotalCount:      totalLocal + totalSupplement + totalSkip + totalUnknown,
+		LocalCount:      totalLocal,
+		SupplementCount: totalSupplement,
+		SkipCount:       totalSkip,
+		UnknownCount:    totalUnknown,
+	}
+
+	return report
 }
 
-// generateSuggestions 生成配置建议
+// GetLocalAlternatives returns local alternatives for cluster-level data types
+func (v *DataTypeValidator) getLocalAlternatives(clusterType string) []string {
+	// Map cluster types to local alternatives
+	clusterToLocal := map[string][]string{
+		"node_cpu_usage":     {"cpu_throttling", "cpu_temperature", "cpu_frequency"},
+		"node_memory_usage":  {"memory_fragmentation", "swap_usage", "oom_events"},
+		"node_disk_io":       {"disk_smart", "disk_errors", "disk_performance"},
+		"node_network_bytes": {"network_interface_errors", "tcp_retransmit_rate"},
+	}
+
+	if alts, exists := clusterToLocal[clusterType]; exists {
+		return alts
+	}
+
+	// Default alternatives for unknown types
+	return []string{"system_load", "file_descriptors", "kernel_logs"}
+}
+
+// GenerateSuggestions generates suggestions based on validation results
 func (v *DataTypeValidator) generateSuggestions(result *CheckValidationResult, mode string) []string {
 	suggestions := []string{}
 
 	switch mode {
 	case "仅本地":
-		if result.Stats.SkipCount > 0 {
-			suggestions = append(suggestions, "仅本地模式下移除了集群级采集器")
-		}
 		if result.Stats.SupplementCount > 0 {
-			suggestions = append(suggestions, "仅本地模式下集群补充采集器也被移除")
+			suggestions = append(suggestions, "当前为仅本地模式，但包含集群补充数据类型，建议检查配置")
+		}
+		if result.Stats.SkipCount > 0 {
+			suggestions = append(suggestions, "检测到集群级数据类型，建议移除或使用本地替代")
 		}
 	case "集群补充":
 		if result.Stats.LocalCount > 0 {
-			suggestions = append(suggestions, "集群补充模式下节点本地采集器也被保留")
+			suggestions = append(suggestions, "当前为集群补充模式，但包含节点本地数据类型，建议确认是否需要")
 		}
 	case "自动选择":
 		if result.Stats.UnknownCount > 0 {
-			suggestions = append(suggestions, "建议明确未知类型采集器的数据范围")
+			suggestions = append(suggestions, "检测到未知类型采集器，建议确认数据类型分类")
 		}
 	}
 
@@ -197,81 +260,38 @@ func (v *DataTypeValidator) generateSuggestions(result *CheckValidationResult, m
 		suggestions = append(suggestions, "考虑移除被跳过的采集器以简化配置")
 	}
 
+	if len(suggestions) == 0 {
+		suggestions = append(suggestions, "配置验证通过，当前模式适合所有采集器")
+	}
+
 	return suggestions
 }
 
-// getLocalAlternatives 获取本地替代采集器
-func (v *DataTypeValidator) getLocalAlternatives(clusterType string) []string {
-	alternatives := []string{}
-
-	// 根据集群级类型提供对应的本地采集器
-	switch {
-	case strings.Contains(clusterType, "cpu"):
-		alternatives = []string{"cpu_throttling", "cpu_temperature", "cpu_frequency"}
-	case strings.Contains(clusterType, "memory"):
-		alternatives = []string{"memory_fragmentation", "swap_usage", "oom_events"}
-	case strings.Contains(clusterType, "disk"):
-		alternatives = []string{"disk_smart", "disk_errors", "disk_performance"}
-	case strings.Contains(clusterType, "network"):
-		alternatives = []string{"network_interface_errors", "tcp_retransmit_rate"}
-	default:
-		alternatives = []string{"system_load", "file_descriptors", "kernel_logs"}
-	}
-
-	return alternatives
-}
-
-// GetValidationReport 生成完整的验证报告
-func (v *DataTypeValidator) GetValidationReport(checks map[string][]string, mode string) *ValidationReport {
-	report := &ValidationReport{
-		Mode:        mode,
-		TotalChecks: len(checks),
-		Results:     make(map[string]*CheckValidationResult),
-	}
-
-	for checkName, collectors := range checks {
-		report.Results[checkName] = v.ValidateCheckConfig(checkName, collectors, mode)
-	}
-
-	// 计算总体统计
-	report.calculateOverallStats()
-
-	return report
-}
-
-// ValidationReport 完整验证报告
-type ValidationReport struct {
-	Mode         string                            // 采集模式
-	TotalChecks  int                               // 总检查项数量
-	Results      map[string]*CheckValidationResult // 检查项验证结果
-	OverallStats ValidationStats                   // 总体统计
-}
-
-// calculateOverallStats 计算总体统计信息
-func (r *ValidationReport) calculateOverallStats() {
-	stats := ValidationStats{}
-
-	for _, result := range r.Results {
-		stats.TotalCount += result.Stats.TotalCount
-		stats.LocalCount += result.Stats.LocalCount
-		stats.SupplementCount += result.Stats.SupplementCount
-		stats.SkipCount += result.Stats.SkipCount
-		stats.UnknownCount += result.Stats.UnknownCount
-	}
-
-	r.OverallStats = stats
-}
-
-// GetSummary 获取验证摘要
+// GetSummary returns a human-readable summary of the validation report
 func (r *ValidationReport) GetSummary() string {
-	return fmt.Sprintf(
-		"模式: %s, 检查项: %d, 采集器: %d (本地: %d, 补充: %d, 跳过: %d, 未知: %d)",
-		r.Mode,
-		r.TotalChecks,
-		r.OverallStats.TotalCount,
-		r.OverallStats.LocalCount,
-		r.OverallStats.SupplementCount,
-		r.OverallStats.SkipCount,
-		r.OverallStats.UnknownCount,
-	)
+	var lines []string
+	lines = append(lines, fmt.Sprintf("模式: %s", r.Mode))
+	lines = append(lines, fmt.Sprintf("检查项: %d", r.TotalChecks))
+	lines = append(lines, fmt.Sprintf("总采集器: %d", r.OverallStats.TotalCount))
+	lines = append(lines, fmt.Sprintf("节点本地: %d", r.OverallStats.LocalCount))
+	lines = append(lines, fmt.Sprintf("集群补充: %d", r.OverallStats.SupplementCount))
+	lines = append(lines, fmt.Sprintf("跳过采集: %d", r.OverallStats.SkipCount))
+	lines = append(lines, fmt.Sprintf("未知类型: %d", r.OverallStats.UnknownCount))
+	return strings.Join(lines, "\n")
+}
+
+// cacheResult stores a validation result in cache
+func (v *DataTypeValidator) cacheResult(key string, result *ValidationResult) {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	v.cache[key] = result
+}
+
+// ClearCache clears the validation cache
+func (v *DataTypeValidator) ClearCache() {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	for key := range v.cache {
+		delete(v.cache, key)
+	}
 }
