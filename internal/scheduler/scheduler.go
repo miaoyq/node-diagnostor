@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/miaoyq/node-diagnostor/internal/config"
+	"github.com/miaoyq/node-diagnostor/internal/processor"
+	"github.com/miaoyq/node-diagnostor/internal/reporter"
 	"go.uber.org/zap"
 )
 
@@ -141,7 +143,9 @@ type CheckScheduler struct {
 	wg            sync.WaitGroup
 	maxConcurrent int
 	semaphore     chan struct{}
-	taskTimers    map[string]*time.Timer // 新增：任务定时器映射
+	taskTimers    map[string]*time.Timer   // 新增：任务定时器映射
+	processor     processor.Processor      // 新增：数据处理器
+	reporter      *reporter.ReporterClient // 新增：数据上报器
 }
 
 // New creates a new CheckScheduler instance
@@ -159,6 +163,16 @@ func New(executor Executor, monitor Monitor, logger *zap.Logger) *CheckScheduler
 		semaphore:     make(chan struct{}, 1),
 		taskTimers:    make(map[string]*time.Timer),
 	}
+}
+
+// SetProcessor sets the data processor
+func (cs *CheckScheduler) SetProcessor(processor processor.Processor) {
+	cs.processor = processor
+}
+
+// SetReporter sets the data reporter
+func (cs *CheckScheduler) SetReporter(reporter *reporter.ReporterClient) {
+	cs.reporter = reporter
 }
 
 // Add adds a new task to the scheduler
@@ -446,6 +460,11 @@ func (cs *CheckScheduler) executeTask(task *Task) {
 		}
 	}
 
+	// Process and report data if successful
+	if err == nil && result != nil {
+		cs.processAndReportData(ctx, task, result)
+	}
+
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -487,6 +506,97 @@ func (cs *CheckScheduler) executeTask(task *Task) {
 	}
 }
 
+// processAndReportData processes collected data and reports it
+func (cs *CheckScheduler) processAndReportData(ctx context.Context, task *Task, result interface{}) {
+	if cs.processor == nil || cs.reporter == nil {
+		cs.logger.Warn("Processor or reporter not configured, skipping data processing and reporting")
+		return
+	}
+
+	// Process the collected data
+	processedData, err := cs.processor.Process(ctx, result)
+	if err != nil {
+		cs.logger.Error("Failed to process data", zap.Error(err))
+		return
+	}
+
+	// Create report from processed data
+	report := &reporter.Report{
+		ID:        fmt.Sprintf("%s-%d", task.Name, time.Now().Unix()),
+		Data:      processedData.Data,
+		Timestamp: processedData.Timestamp,
+		NodeName:  processedData.NodeName,
+		CheckName: task.Name,
+	}
+
+	// Report the data
+	_, err = cs.reporter.Report(ctx, report)
+	if err != nil {
+		cs.logger.Error("Failed to report data", zap.Error(err))
+	} else {
+		cs.logger.Debug("Data reported successfully", zap.String("task_id", task.ID))
+	}
+}
+
+// GetTask retrieves a task by ID
+func (cs *CheckScheduler) GetTask(taskID string) (*Task, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	task, exists := cs.tasks[taskID]
+	if !exists {
+		return nil, fmt.Errorf("task %s not found", taskID)
+	}
+	return task, nil
+}
+
+// ListTasks returns all scheduled tasks
+func (cs *CheckScheduler) ListTasks() []*Task {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	tasks := make([]*Task, 0, len(cs.tasks))
+	for _, task := range cs.tasks {
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
+// UpdateTask updates an existing task
+func (cs *CheckScheduler) UpdateTask(ctx context.Context, task *Task) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if _, exists := cs.tasks[task.ID]; !exists {
+		return fmt.Errorf("task %s not found", task.ID)
+	}
+
+	// Stop existing timer
+	cs.stopTaskTimer(task.ID)
+
+	// Update task
+	cs.tasks[task.ID] = task
+
+	// Restart timer if enabled and running
+	if task.Enabled && cs.running {
+		cs.startTaskTimer(task)
+	}
+
+	cs.logger.Info("Task updated", zap.String("task_id", task.ID))
+	return nil
+}
+
+// GetStatus returns the scheduler status
+func (cs *CheckScheduler) GetStatus() string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	if cs.running {
+		return "running"
+	}
+	return "stopped"
+}
+
 // StartTask starts a specific task
 func (cs *CheckScheduler) StartTask(ctx context.Context, taskID string) error {
 	cs.mu.Lock()
@@ -503,7 +613,6 @@ func (cs *CheckScheduler) StartTask(ctx context.Context, taskID string) error {
 
 	task.Enabled = true
 	task.Status = TaskStatusPending
-	task.NextRun = time.Now().Add(task.Interval)
 
 	if cs.running {
 		cs.startTaskTimer(task)
@@ -521,6 +630,10 @@ func (cs *CheckScheduler) StopTask(ctx context.Context, taskID string) error {
 	task, exists := cs.tasks[taskID]
 	if !exists {
 		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	if !task.Enabled {
+		return fmt.Errorf("task %s is already disabled", taskID)
 	}
 
 	task.Enabled = false
@@ -541,7 +654,13 @@ func (cs *CheckScheduler) PauseTask(ctx context.Context, taskID string) error {
 		return fmt.Errorf("task %s not found", taskID)
 	}
 
+	if task.Status == TaskStatusPaused {
+		return fmt.Errorf("task %s is already paused", taskID)
+	}
+
 	task.Status = TaskStatusPaused
+	cs.stopTaskTimer(taskID)
+
 	cs.logger.Info("Task paused", zap.String("task_id", taskID))
 	return nil
 }
@@ -561,7 +680,11 @@ func (cs *CheckScheduler) ResumeTask(ctx context.Context, taskID string) error {
 	}
 
 	task.Status = TaskStatusPending
-	task.NextRun = time.Now().Add(task.Interval)
+
+	if cs.running && task.Enabled {
+		cs.startTaskTimer(task)
+	}
+
 	cs.logger.Info("Task resumed", zap.String("task_id", taskID))
 	return nil
 }
@@ -575,84 +698,34 @@ func (cs *CheckScheduler) GetTaskStatus(taskID string) (TaskStatus, error) {
 	if !exists {
 		return "", fmt.Errorf("task %s not found", taskID)
 	}
-
 	return task.Status, nil
 }
 
-// GetTask retrieves a task by ID
-func (cs *CheckScheduler) GetTask(taskID string) (*Task, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	task, exists := cs.tasks[taskID]
-	if !exists {
-		return nil, fmt.Errorf("task %s not found", taskID)
-	}
-
-	return task, nil
-}
-
-// ListTasks returns all scheduled tasks
-func (cs *CheckScheduler) ListTasks() []*Task {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	tasks := make([]*Task, 0, len(cs.tasks))
-	for _, task := range cs.tasks {
-		tasks = append(tasks, task)
-	}
-
-	return tasks
-}
-
-// UpdateTask updates an existing task
-func (cs *CheckScheduler) UpdateTask(ctx context.Context, task *Task) error {
+// SetMaxConcurrent sets the maximum number of concurrent executions
+func (cs *CheckScheduler) SetMaxConcurrent(maxConcurrent int) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if _, exists := cs.tasks[task.ID]; !exists {
-		return fmt.Errorf("task %s not found", task.ID)
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
 	}
 
-	// 如果任务正在运行，先停止定时器
-	if timer, exists := cs.taskTimers[task.ID]; exists {
-		timer.Stop()
-		delete(cs.taskTimers, task.ID)
+	// Update semaphore
+	oldSemaphore := cs.semaphore
+	cs.semaphore = make(chan struct{}, maxConcurrent)
+	cs.maxConcurrent = maxConcurrent
+
+	// Fill new semaphore with existing permits
+	for i := 0; i < len(oldSemaphore); i++ {
+		select {
+		case <-oldSemaphore:
+			cs.semaphore <- struct{}{}
+		default:
+			break
+		}
 	}
 
-	// 更新任务
-	cs.tasks[task.ID] = task
-
-	// 如果调度器正在运行且任务启用，重新启动定时器
-	if cs.running && task.Enabled {
-		cs.startTaskTimer(task)
-	}
-
-	cs.logger.Info("Task updated", zap.String("task_id", task.ID))
-	return nil
-}
-
-// GetStatus returns the scheduler status
-func (cs *CheckScheduler) GetStatus() string {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	status := "stopped"
-	if cs.running {
-		status = "running"
-	}
-
-	return fmt.Sprintf("Scheduler %s: %d tasks, %d queued",
-		status, len(cs.tasks), cs.taskQueue.Len())
-}
-
-// SetMaxConcurrent sets the maximum concurrent executions
-func (cs *CheckScheduler) SetMaxConcurrent(max int) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	cs.maxConcurrent = max
-	cs.semaphore = make(chan struct{}, max)
+	cs.logger.Info("Max concurrent executions updated", zap.Int("max_concurrent", maxConcurrent))
 }
 
 // GetMetrics returns scheduler metrics

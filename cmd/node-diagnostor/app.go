@@ -93,6 +93,12 @@ func (a *App) Initialize() error {
 	// Initialize reporter using configuration
 	a.reporter = reporter.NewReporterClient(cfg.Reporter, a.logger.With(zap.String("module", "reporter")))
 
+	// Set processor and reporter for scheduler
+	if schedulerImpl, ok := a.scheduler.(*scheduler.CheckScheduler); ok {
+		schedulerImpl.SetProcessor(a.processor)
+		schedulerImpl.SetReporter(a.reporter)
+	}
+
 	// Add tasks from configuration
 	if err := a.addTasksFromConfig(cfg); err != nil {
 		return fmt.Errorf("failed to add tasks from config: %w", err)
