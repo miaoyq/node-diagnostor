@@ -175,6 +175,29 @@ func (cm *CacheManager) Clear() {
 	cm.cache = make(map[string]*CacheEntry)
 }
 
+// UpdateConfig updates cache configuration
+func (cm *CacheManager) UpdateConfig(maxSize int64, maxAge time.Duration) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	oldMaxSize := cm.maxSize
+	oldMaxAge := cm.maxAge
+
+	cm.maxSize = maxSize
+	cm.maxAge = maxAge
+
+	cm.logger.Info("Cache configuration updated",
+		zap.Int64("old_max_size", oldMaxSize),
+		zap.Int64("new_max_size", maxSize),
+		zap.Duration("old_max_age", oldMaxAge),
+		zap.Duration("new_max_age", maxAge))
+
+	// Trigger cleanup if new limits are smaller
+	if maxSize < oldMaxSize || maxAge < oldMaxAge {
+		cm.cleanup()
+	}
+}
+
 // cleanupRoutine periodically cleans expired and oversized cache entries
 func (cm *CacheManager) cleanupRoutine(ctx context.Context) {
 	defer cm.wg.Done()

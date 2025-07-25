@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miaoyq/node-diagnostor/internal/config"
 	"go.uber.org/zap"
 )
 
@@ -91,6 +92,12 @@ type Scheduler interface {
 
 	// GetTaskStatus returns the status of a specific task
 	GetTaskStatus(taskID string) (TaskStatus, error)
+
+	// SetMaxConcurrent sets the maximum number of concurrent executions
+	SetMaxConcurrent(maxConcurrent int)
+
+	// OnConfigUpdate add ConfigSubscriber interface implementation for scheduler
+	OnConfigUpdate(newConfig *config.Config) error
 }
 
 // Executor defines the interface for task execution
@@ -139,6 +146,9 @@ type CheckScheduler struct {
 
 // New creates a new CheckScheduler instance
 func New(executor Executor, monitor Monitor, logger *zap.Logger) *CheckScheduler {
+	if monitor == nil {
+		monitor = NewTaskMonitor()
+	}
 	return &CheckScheduler{
 		tasks:         make(map[string]*Task),
 		taskQueue:     NewPriorityQueue(),
@@ -663,4 +673,61 @@ func (cs *CheckScheduler) GetMetrics() map[string]interface{} {
 		"max_concurrent": cs.maxConcurrent,
 		"status_counts":  statusCounts,
 	}
+}
+
+// Add ConfigSubscriber interface implementation for scheduler
+func (cs *CheckScheduler) OnConfigUpdate(newConfig *config.Config) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.logger.Info("Scheduler received config update")
+
+	// Update scheduler configuration
+	if newConfig.ResourceLimits.MaxConcurrent > 0 {
+		cs.SetMaxConcurrent(newConfig.ResourceLimits.MaxConcurrent)
+	}
+
+	// Remove all existing tasks
+	tasks := cs.ListTasks()
+	for _, task := range tasks {
+		if err := cs.Remove(context.Background(), task.ID); err != nil {
+			cs.logger.Error("Failed to remove task during config update",
+				zap.String("task_id", task.ID), zap.Error(err))
+		}
+	}
+
+	// Add new tasks from configuration
+	addedTasks := 0
+	for _, check := range newConfig.Checks {
+		if !check.Enabled {
+			continue
+		}
+
+		// Create a task for each collector in the check
+		for _, collectorID := range check.Collectors {
+			taskID := fmt.Sprintf("%s-%s", check.Name, collectorID)
+			task := &Task{
+				ID:         taskID,
+				Name:       check.Name,
+				Collector:  collectorID,
+				Parameters: check.Params,
+				Interval:   check.Interval,
+				Priority:   check.Priority,
+				Timeout:    check.Timeout,
+				Enabled:    true,
+				MaxRetries: 3,
+				Status:     TaskStatusPending,
+			}
+
+			if err := cs.Add(context.Background(), task); err != nil {
+				cs.logger.Error("Failed to add task from updated config",
+					zap.String("task_id", taskID), zap.Error(err))
+				continue
+			}
+			addedTasks++
+		}
+	}
+
+	cs.logger.Info("Scheduler config update completed", zap.Int("task_count", addedTasks))
+	return nil
 }

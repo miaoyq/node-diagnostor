@@ -1,0 +1,140 @@
+{
+  "version": "1.0.0",
+  "checks": [
+    {
+      "name": "cpu_monitoring",
+      "interval": "1m",
+      "mode": "local_only",
+      "collectors": ["cpu_throttling", "cpu_temperature", "cpu_frequency"],
+      "params": {
+        "threshold": 80,
+        "window": "1m"
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 1
+    },
+    {
+      "name": "memory_monitoring",
+      "interval": "2m",
+      "mode": "local_only",
+      "collectors": ["memory_fragmentation", "swap_usage", "oom_events"],
+      "params": {
+        "threshold": 90,
+        "window": "2m"
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 1
+    },
+    {
+      "name": "disk_monitoring",
+      "interval": "5m",
+      "mode": "local_only",
+      "collectors": ["disk_smart", "disk_errors", "disk_performance"],
+      "params": {
+        "threshold": 85,
+        "window": "5m"
+      },
+      "enabled": true,
+      "timeout": "60s",
+      "priority": 2
+    },
+    {
+      "name": "network_monitoring",
+      "interval": "3m",
+      "mode": "local_only",
+      "collectors": ["network_interface_errors", "tcp_retransmission"],
+      "params": {
+        "threshold": 5,
+        "window": "3m"
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 2
+    },
+    {
+      "name": "kubelet_health",
+      "interval": "1m",
+      "mode": "local_only",
+      "collectors": ["kubelet_process", "kubelet_logs", "kubelet_certificates"],
+      "params": {
+        "log_level": "error",
+        "cert_warning_days": 30
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 1
+    },
+    {
+      "name": "container_runtime",
+      "interval": "2m",
+      "mode": "local_only",
+      "collectors": ["containerd_process", "containerd_memory", "containerd_logs"],
+      "params": {
+        "log_level": "error",
+        "memory_threshold": 100
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 2
+    },
+    {
+      "name": "system_health",
+      "interval": "5m",
+      "mode": "local_only",
+      "collectors": ["system_load", "file_descriptors", "kernel_logs", "ntp_sync"],
+      "params": {
+        "load_threshold": 5.0,
+        "fd_threshold": 80
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 3
+    },
+    {
+      "name": "process_resources",
+      "interval": "10m",
+      "mode": "cluster_supplement",
+      "collectors": ["process_resource_usage"],
+      "params": {
+        "top_processes": 10,
+        "memory_threshold": 100
+      },
+      "enabled": true,
+      "timeout": "60s",
+      "priority": 4
+    },
+    {
+      "name": "certificate_check",
+      "interval": "60m",
+      "mode": "cluster_supplement",
+      "collectors": ["certificate_validity"],
+      "params": {
+        "warning_days": 30,
+        "critical_days": 7
+      },
+      "enabled": true,
+      "timeout": "30s",
+      "priority": 5
+    }
+  ],
+  "resource_limits": {
+    "max_cpu_percent": 5,
+    "max_memory_mb": 100,
+    "max_concurrent_checks": 1
+  },
+  "data_scope": {
+    "default_mode": "auto",
+    "cache_ttl": "1h"
+  },
+  "reporter": {
+    "endpoint": "http://localhost:8080/api/reports",
+    "timeout": "30s",
+    "max_retries": 3,
+    "retry_delay": "5s",
+    "compression": true,
+    "cache_max_size": "100MB",
+    "cache_max_age": "24h"
+  }
+}

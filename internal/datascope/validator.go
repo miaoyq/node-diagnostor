@@ -1,297 +1,228 @@
 package datascope
 
 import (
-	"fmt"
-	"strings"
+	"context"
 	"sync"
 )
 
-// ValidationResult represents the result of validating a single collector
+// Scope defines the data collection scope
+type Scope string
+
+const (
+	ScopeLocalOnly         Scope = "local_only"
+	ScopeClusterSupplement Scope = "cluster_supplement"
+	ScopeAuto              Scope = "auto"
+)
+
+// ValidationResult represents the result of a validation check
 type ValidationResult struct {
-	Collector  string
-	IsValid    bool
-	Category   string
-	Reason     string
-	Suggestion string
-	Metadata   map[string]interface{}
+	Valid   bool
+	Skipped bool
+	Reason  string
+	Details map[string]interface{}
 }
 
-// CheckValidationResult represents the result of validating a check configuration
-type CheckValidationResult struct {
-	CheckName  string
-	Valid      bool
-	Mode       string
-	Collectors []ValidationResult
-	Errors     []string
-	Stats      ValidationStats
+// Validator defines the interface for data scope validation
+type Validator interface {
+	// ValidateCollector validates if a collector should run based on scope
+	ValidateCollector(ctx context.Context, collectorName string, scope Scope) (*ValidationResult, error)
+
+	// ValidateDataType validates if a data type should be collected
+	ValidateDataType(ctx context.Context, dataType string, scope Scope) (*ValidationResult, error)
+
+	// GetLocalOnlyTypes returns all local-only data types
+	GetLocalOnlyTypes() []string
+
+	// GetClusterTypes returns all cluster supplement data types
+	GetClusterTypes() []string
+
+	// IsLocalOnly checks if a data type is local-only
+	IsLocalOnly(dataType string) bool
+
+	// IsClusterSupplement checks if a data type is cluster supplement
+	IsClusterSupplement(dataType string) bool
 }
 
-// ValidationStats contains statistics about validation results
-type ValidationStats struct {
-	TotalCount      int
-	LocalCount      int
-	SupplementCount int
-	SkipCount       int
-	UnknownCount    int
+// validator implements the Validator interface
+type validator struct {
+	localOnlyTypes    map[string]bool
+	clusterTypes      map[string]bool
+	clusterSupplement map[string]bool
+	cache             map[string]*ValidationResult
+	cacheMutex        sync.RWMutex
 }
 
-// ValidationReport contains comprehensive validation results
-type ValidationReport struct {
-	Mode         string
-	TotalChecks  int
-	Results      map[string]*CheckValidationResult
-	OverallStats ValidationStats
+// NewValidator creates a new validator instance
+func NewValidator() Validator {
+	v := &validator{
+		localOnlyTypes:    make(map[string]bool),
+		clusterTypes:      make(map[string]bool),
+		clusterSupplement: make(map[string]bool),
+		cache:             make(map[string]*ValidationResult),
+	}
+
+	// Initialize data type mappings
+	v.initializeDataTypes()
+	return v
 }
 
-// DataTypeValidator validates collector configurations based on data scope
-type DataTypeValidator struct {
-	checker *DataScopeChecker
-	mapper  *Mapper
-	cache   map[string]*ValidationResult
-	mutex   sync.RWMutex
-}
+// initializeDataTypes sets up the predefined data type mappings
+func (v *validator) initializeDataTypes() {
+	// Node-local only data types
+	localOnlyTypes := []string{
+		"cpu_throttling",
+		"cpu_temperature",
+		"cpu_frequency",
+		"memory_fragmentation",
+		"swap_usage",
+		"oom_events",
+		"disk_smart",
+		"disk_errors",
+		"disk_performance",
+		"network_interface_errors",
+		"tcp_retransmission",
+		"network_buffer",
+		"kubelet_process",
+		"kubelet_logs",
+		"kubelet_config",
+		"kubelet_certificates",
+		"containerd_process",
+		"containerd_memory",
+		"containerd_logs",
+		"cni_process",
+		"cni_config",
+		"kube_proxy_process",
+		"kube_proxy_logs",
+		"system_load",
+		"file_descriptors",
+		"kernel_logs",
+		"ntp_sync",
+	}
 
-// NewDataTypeValidator creates a new data type validator
-func NewDataTypeValidator(checker *DataScopeChecker) *DataTypeValidator {
-	return &DataTypeValidator{
-		checker: checker,
-		mapper:  NewMapper(),
-		cache:   make(map[string]*ValidationResult),
+	// Cluster supplement data types
+	clusterSupplementTypes := []string{
+		"process_resource_usage",
+		"kernel_events",
+		"config_file_status",
+		"certificate_validity",
+	}
+
+	// Populate maps
+	for _, t := range localOnlyTypes {
+		v.localOnlyTypes[t] = true
+	}
+
+	for _, t := range clusterSupplementTypes {
+		v.clusterSupplement[t] = true
+	}
+
+	// Mark known cluster types (these should be skipped)
+	clusterTypes := []string{
+		"node_cpu_usage",
+		"node_memory_usage",
+		"node_disk_usage",
+		"node_network_usage",
+		"pod_status",
+		"container_status",
+	}
+
+	for _, t := range clusterTypes {
+		v.clusterTypes[t] = true
 	}
 }
 
-// ValidateCollector validates if a collector should run based on its data type
-func (v *DataTypeValidator) ValidateCollector(collector string) *ValidationResult {
-	v.mutex.RLock()
-	if cached, exists := v.cache[collector]; exists {
-		v.mutex.RUnlock()
-		return cached
+// ValidateCollector validates if a collector should run based on scope
+func (v *validator) ValidateCollector(ctx context.Context, collectorName string, scope Scope) (*ValidationResult, error) {
+	cacheKey := collectorName + ":" + string(scope)
+
+	// Check cache first
+	if cached, exists := v.getCachedResult(cacheKey); exists {
+		return cached, nil
 	}
-	v.mutex.RUnlock()
 
 	result := &ValidationResult{
-		Collector: collector,
-		IsValid:   true,
-		Metadata:  make(map[string]interface{}),
+		Valid:   true,
+		Skipped: false,
+		Reason:  "",
+		Details: make(map[string]interface{}),
 	}
 
-	// Determine data type using mapper
-	dataType, err := v.mapper.GetDataType(collector)
-	if err != nil {
-		result.IsValid = true
-		result.Category = "unknown"
-		result.Reason = fmt.Sprintf("采集器 '%s' 是未知类型，默认作为节点本地数据处理", collector)
-		result.Suggestion = "建议确认该采集器的数据类型，或将其归类到合适的数据类型"
-		result.Metadata["scope"] = "unknown"
-		result.Metadata["priority"] = "low"
-		v.cacheResult(collector, result)
-		return result
-	}
-
-	switch dataType {
-	case NodeLocal:
-		result.IsValid = true
-		result.Category = "node_local"
-		result.Reason = fmt.Sprintf("采集器 '%s' 是节点本地独有数据类型，必须在本地采集", collector)
-		result.Suggestion = "该采集器提供的数据无法通过集群监控获取，建议保留"
-		result.Metadata["scope"] = "node_local"
-		result.Metadata["priority"] = "high"
-	case ClusterLevel:
-		result.IsValid = false
-		result.Category = "cluster_level"
-		result.Reason = fmt.Sprintf("采集器 '%s' 是集群级数据类型，已由集群监控覆盖，无需本地采集", collector)
-		result.Suggestion = "建议移除该采集器，使用集群监控数据替代"
-		result.Metadata["scope"] = "cluster"
-		result.Metadata["priority"] = "skip"
-	case ClusterSupplement:
-		result.IsValid = true
-		result.Category = "cluster_supplement"
-		result.Reason = fmt.Sprintf("采集器 '%s' 是集群监控无法提供的补充数据，需要在本地采集", collector)
-		result.Suggestion = "该采集器提供集群监控缺失的细节数据，建议保留"
-		result.Metadata["scope"] = "supplement"
-		result.Metadata["priority"] = "medium"
-	}
-
-	v.cacheResult(collector, result)
-	return result
-}
-
-// ValidateCollectors validates multiple collectors
-func (v *DataTypeValidator) ValidateCollectors(collectors []string) []ValidationResult {
-	results := make([]ValidationResult, len(collectors))
-	for i, collector := range collectors {
-		results[i] = *v.ValidateCollector(collector)
-	}
-	return results
-}
-
-// ValidateCheckConfig validates a complete check configuration
-func (v *DataTypeValidator) ValidateCheckConfig(checkName string, collectors []string, mode string) *CheckValidationResult {
-	result := &CheckValidationResult{
-		CheckName:  checkName,
-		Mode:       mode,
-		Collectors: make([]ValidationResult, len(collectors)),
-		Errors:     []string{},
-	}
-
-	var localCount, supplementCount, skipCount, unknownCount int
-
-	for i, collector := range collectors {
-		validation := v.ValidateCollector(collector)
-		result.Collectors[i] = *validation
-
-		switch validation.Category {
-		case "node_local":
-			localCount++
-		case "cluster_supplement":
-			supplementCount++
-		case "cluster_level":
-			skipCount++
-		case "unknown":
-			unknownCount++
+	switch scope {
+	case ScopeLocalOnly:
+		if !v.IsLocalOnly(collectorName) {
+			result.Valid = false
+			result.Skipped = true
+			result.Reason = "collector is not node-local only"
 		}
-
-		// Check mode-specific validation
-		if !v.isValidForMode(*validation, mode) {
-			errMsg := fmt.Sprintf("采集器 '%s' 不适合 %s 模式: %s", collector, mode, validation.Reason)
-			result.Errors = append(result.Errors, errMsg)
+	case ScopeClusterSupplement:
+		if !v.IsClusterSupplement(collectorName) {
+			result.Valid = false
+			result.Skipped = true
+			result.Reason = "collector is not cluster supplement"
+		}
+	case ScopeAuto:
+		if v.IsClusterSupplement(collectorName) {
+			result.Details["type"] = "cluster_supplement"
+		} else if v.IsLocalOnly(collectorName) {
+			result.Details["type"] = "local_only"
+		} else {
+			result.Skipped = true
+			result.Reason = "cluster-level data, use cluster monitoring"
 		}
 	}
 
-	result.Stats = ValidationStats{
-		TotalCount:      len(collectors),
-		LocalCount:      localCount,
-		SupplementCount: supplementCount,
-		SkipCount:       skipCount,
-		UnknownCount:    unknownCount,
-	}
-
-	result.Valid = len(result.Errors) == 0
-	return result
+	// Cache the result
+	v.cacheResult(cacheKey, result)
+	return result, nil
 }
 
-// isValidForMode checks if a validation result is valid for the given mode
-func (v *DataTypeValidator) isValidForMode(validation ValidationResult, mode string) bool {
-	switch mode {
-	case "仅本地":
-		return validation.Category == "node_local" || validation.Category == "unknown"
-	case "集群补充":
-		return validation.Category == "cluster_supplement" || validation.Category == "unknown"
-	case "自动选择":
-		return true // 自动选择模式下所有类型都有效
-	default:
-		return true
-	}
+// ValidateDataType validates if a data type should be collected
+func (v *validator) ValidateDataType(ctx context.Context, dataType string, scope Scope) (*ValidationResult, error) {
+	return v.ValidateCollector(ctx, dataType, scope)
 }
 
-// GetValidationReport generates a comprehensive validation report
-func (v *DataTypeValidator) GetValidationReport(checks map[string][]string, mode string) *ValidationReport {
-	report := &ValidationReport{
-		Mode:        mode,
-		TotalChecks: len(checks),
-		Results:     make(map[string]*CheckValidationResult),
+// GetLocalOnlyTypes returns all local-only data types
+func (v *validator) GetLocalOnlyTypes() []string {
+	types := make([]string, 0, len(v.localOnlyTypes))
+	for t := range v.localOnlyTypes {
+		types = append(types, t)
 	}
-
-	var totalLocal, totalSupplement, totalSkip, totalUnknown int
-
-	for checkName, collectors := range checks {
-		result := v.ValidateCheckConfig(checkName, collectors, mode)
-		report.Results[checkName] = result
-
-		totalLocal += result.Stats.LocalCount
-		totalSupplement += result.Stats.SupplementCount
-		totalSkip += result.Stats.SkipCount
-		totalUnknown += result.Stats.UnknownCount
-	}
-
-	report.OverallStats = ValidationStats{
-		TotalCount:      totalLocal + totalSupplement + totalSkip + totalUnknown,
-		LocalCount:      totalLocal,
-		SupplementCount: totalSupplement,
-		SkipCount:       totalSkip,
-		UnknownCount:    totalUnknown,
-	}
-
-	return report
+	return types
 }
 
-// GetLocalAlternatives returns local alternatives for cluster-level data types
-func (v *DataTypeValidator) getLocalAlternatives(clusterType string) []string {
-	// Map cluster types to local alternatives
-	clusterToLocal := map[string][]string{
-		"node_cpu_usage":     {"cpu_throttling", "cpu_temperature", "cpu_frequency"},
-		"node_memory_usage":  {"memory_fragmentation", "swap_usage", "oom_events"},
-		"node_disk_io":       {"disk_smart", "disk_errors", "disk_performance"},
-		"node_network_bytes": {"network_interface_errors", "tcp_retransmit_rate"},
+// GetClusterTypes returns all cluster supplement data types
+func (v *validator) GetClusterTypes() []string {
+	types := make([]string, 0, len(v.clusterSupplement))
+	for t := range v.clusterSupplement {
+		types = append(types, t)
 	}
-
-	if alts, exists := clusterToLocal[clusterType]; exists {
-		return alts
-	}
-
-	// Default alternatives for unknown types
-	return []string{"system_load", "file_descriptors", "kernel_logs"}
+	return types
 }
 
-// GenerateSuggestions generates suggestions based on validation results
-func (v *DataTypeValidator) generateSuggestions(result *CheckValidationResult, mode string) []string {
-	suggestions := []string{}
-
-	switch mode {
-	case "仅本地":
-		if result.Stats.SupplementCount > 0 {
-			suggestions = append(suggestions, "当前为仅本地模式，但包含集群补充数据类型，建议检查配置")
-		}
-		if result.Stats.SkipCount > 0 {
-			suggestions = append(suggestions, "检测到集群级数据类型，建议移除或使用本地替代")
-		}
-	case "集群补充":
-		if result.Stats.LocalCount > 0 {
-			suggestions = append(suggestions, "当前为集群补充模式，但包含节点本地数据类型，建议确认是否需要")
-		}
-	case "自动选择":
-		if result.Stats.UnknownCount > 0 {
-			suggestions = append(suggestions, "检测到未知类型采集器，建议确认数据类型分类")
-		}
-	}
-
-	// 通用建议
-	if result.Stats.SkipCount > 0 {
-		suggestions = append(suggestions, "考虑移除被跳过的采集器以简化配置")
-	}
-
-	if len(suggestions) == 0 {
-		suggestions = append(suggestions, "配置验证通过，当前模式适合所有采集器")
-	}
-
-	return suggestions
+// IsLocalOnly checks if a data type is local-only
+func (v *validator) IsLocalOnly(dataType string) bool {
+	return v.localOnlyTypes[dataType]
 }
 
-// GetSummary returns a human-readable summary of the validation report
-func (r *ValidationReport) GetSummary() string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("模式: %s", r.Mode))
-	lines = append(lines, fmt.Sprintf("检查项: %d", r.TotalChecks))
-	lines = append(lines, fmt.Sprintf("总采集器: %d", r.OverallStats.TotalCount))
-	lines = append(lines, fmt.Sprintf("节点本地: %d", r.OverallStats.LocalCount))
-	lines = append(lines, fmt.Sprintf("集群补充: %d", r.OverallStats.SupplementCount))
-	lines = append(lines, fmt.Sprintf("跳过采集: %d", r.OverallStats.SkipCount))
-	lines = append(lines, fmt.Sprintf("未知类型: %d", r.OverallStats.UnknownCount))
-	return strings.Join(lines, "\n")
+// IsClusterSupplement checks if a data type is cluster supplement
+func (v *validator) IsClusterSupplement(dataType string) bool {
+	return v.clusterSupplement[dataType]
+}
+
+// getCachedResult retrieves a cached validation result
+func (v *validator) getCachedResult(key string) (*ValidationResult, bool) {
+	v.cacheMutex.RLock()
+	defer v.cacheMutex.RUnlock()
+
+	result, exists := v.cache[key]
+	return result, exists
 }
 
 // cacheResult stores a validation result in cache
-func (v *DataTypeValidator) cacheResult(key string, result *ValidationResult) {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-	v.cache[key] = result
-}
+func (v *validator) cacheResult(key string, result *ValidationResult) {
+	v.cacheMutex.Lock()
+	defer v.cacheMutex.Unlock()
 
-// ClearCache clears the validation cache
-func (v *DataTypeValidator) ClearCache() {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-	for key := range v.cache {
-		delete(v.cache, key)
-	}
+	// Simple cache with no eviction for now
+	v.cache[key] = result
 }

@@ -62,6 +62,7 @@ type ReporterClient struct {
 	metrics    *ReporterMetrics
 	stopChan   chan struct{}
 	wg         sync.WaitGroup
+	mu         sync.RWMutex
 }
 
 // ReporterMetrics tracks reporting statistics
@@ -344,4 +345,40 @@ func (rc *ReporterClient) updateMetrics(update func(*ReporterMetrics)) {
 	rc.metrics.mu.Lock()
 	defer rc.metrics.mu.Unlock()
 	update(rc.metrics)
+}
+
+// ConfigSubscriber interface implementation
+func (rc *ReporterClient) OnConfigUpdate(newConfig *config.Config) error {
+	rc.logger.Info("Reporter received config update")
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	// Update reporter configuration
+	oldConfig := rc.config
+	rc.config = newConfig.Reporter
+
+	// Update HTTP client timeout
+	rc.httpClient.Timeout = newConfig.Reporter.Timeout
+
+	// Update cache configuration
+	rc.cache.UpdateConfig(
+		newConfig.Reporter.CacheMaxSize,
+		newConfig.Reporter.CacheMaxAge,
+	)
+
+	// Log configuration changes
+	if oldConfig.Endpoint != newConfig.Reporter.Endpoint {
+		rc.logger.Info("Reporter endpoint updated",
+			zap.String("old", oldConfig.Endpoint),
+			zap.String("new", newConfig.Reporter.Endpoint))
+	}
+
+	if oldConfig.Timeout != newConfig.Reporter.Timeout {
+		rc.logger.Info("Reporter timeout updated",
+			zap.Duration("old", oldConfig.Timeout),
+			zap.Duration("new", newConfig.Reporter.Timeout))
+	}
+
+	rc.logger.Info("Reporter config update completed")
+	return nil
 }
