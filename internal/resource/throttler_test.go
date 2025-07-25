@@ -147,7 +147,7 @@ func TestThrottler_GetRetryInfo(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	throttler := NewThrottler(logger)
 
-	count, lastRetry, shouldRetry := throttler.GetRetryInfo("non-existent")
+	count, _, shouldRetry := throttler.GetRetryInfo("non-existent")
 	if count != 0 {
 		t.Errorf("Expected count 0 for non-existent check, got %d", count)
 	}
@@ -158,7 +158,7 @@ func TestThrottler_GetRetryInfo(t *testing.T) {
 
 	// 记录重试后
 	throttler.RecordRetry("test-check")
-	count, lastRetry, shouldRetry = throttler.GetRetryInfo("test-check")
+	count, lastRetry, _ := throttler.GetRetryInfo("test-check")
 
 	if count != 1 {
 		t.Errorf("Expected count 1, got %d", count)

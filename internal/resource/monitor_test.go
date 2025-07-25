@@ -55,10 +55,6 @@ func TestResourceMonitor_GetCurrentMetrics(t *testing.T) {
 	if metrics.CPUPercent < 0 {
 		t.Errorf("Expected non-negative CPU percent, got %f", metrics.CPUPercent)
 	}
-
-	if metrics.MemoryBytes < 0 {
-		t.Errorf("Expected non-negative memory bytes, got %d", metrics.MemoryBytes)
-	}
 }
 
 func TestResourceMonitor_LimitChecks(t *testing.T) {
