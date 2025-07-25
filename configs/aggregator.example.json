@@ -1,0 +1,7 @@
+{
+  "max_data_points": 1000,
+  "compression": true,
+  "compression_type": "gzip",
+  "max_size_bytes": 10485760,
+  "retention_period": "24h"
+}

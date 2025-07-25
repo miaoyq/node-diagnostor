@@ -1,14 +1,15 @@
 # K8s节点诊断工具设计文档
 
 ## 概述
-本工具作为轻量级节点守护进程运行，采用**配置驱动架构**实现节点健康诊断。通过**检查项与数据采集功能解耦**的设计，支持灵活配置和扩展，确保最小内存占用和固定周期采集。工具专注于**节点本地独有数据**的采集，通过**apiserver数据去重机制**避免与集群级监控重复。
+本工具作为轻量级节点守护进程运行，采用**配置驱动架构**实现节点健康诊断。通过**检查项与数据采集功能解耦**的设计，支持灵活配置和扩展，确保最小内存占用和固定周期采集。工具专注于**节点本地独有数据**的采集，通过**数据范围模式**避免与集群级监控重复。
 
 核心设计原则：
-- **节点本地执行**：所有检查命令在节点本地执行，不访问apiserver
-- **配置驱动**：通过配置文件精确控制采集行为，无需代码修改
+- **节点本地执行**：所有检查命令在节点本地执行，**完全不依赖apiserver**
+- **配置驱动**：通过配置文件精确控制采集行为，支持热更新
 - **轻量级**：CPU使用率<5%，内存使用<100MB
-- **数据去重**：智能识别apiserver已提供数据，避免重复采集
+- **数据去重**：基于数据范围模式智能识别节点本地独有数据
 - **解耦设计**：检查项定义与数据采集功能完全分离
+- **固定周期**：严格按照配置周期执行，不受资源影响
 
 ## 架构设计
 
@@ -16,38 +17,34 @@
 ```mermaid
 flowchart TD
     A[配置管理器<br/>ConfigManager] -->|配置热更新<br/>1秒内响应| B[检查项调度器<br/>CheckScheduler]
-    B -->|触发检查| C[apiserver去重检查<br/>APIServerDedupChecker]
-    C -->|本地独有数据| D[数据采集器管理器<br/>CollectorManager]
-    C -->|已覆盖数据| E[跳过采集<br/>记录跳过原因]
-    D -->|复用采集结果| F[节点本地指标采集器<br/>NodeLocalMetricsCollector]
-    D -->|复用采集结果| G[节点本地日志采集器<br/>NodeLocalLogCollector]
-    D -->|复用采集结果| H[节点本地进程采集器<br/>NodeLocalProcessCollector]
-    D -->|复用采集结果| I[节点本地网络采集器<br/>NodeLocalNetworkCollector]
-    D -->|复用采集结果| J[节点本地存储采集器<br/>NodeLocalStorageCollector]
-    D -->|复用采集结果| K[节点本地安全采集器<br/>NodeLocalSecurityCollector]
-    F -->|采集结果| L[数据聚合器<br/>DataAggregator]
-    G -->|采集结果| L
-    H -->|采集结果| L
-    I -->|采集结果| L
-    J -->|采集结果| L
-    K -->|采集结果| L
-    L -->|按检查项分组| M[上报客户端<br/>ReporterClient]
-    M -->|HTTP POST| N[监控服务端]
+    B -->|触发检查| C[数据范围检查器<br/>DataScopeChecker]
     
-    O[配置文件监控<br/>FileWatcher] -->|1秒内检测| A
-    P[时间调度器<br/>FixedIntervalScheduler] -->|固定周期| B
-    Q[资源监控器<br/>ResourceMonitor] -->|CPU/内存限制| D
-    R[超时保护器<br/>TimeoutManager] -->|强制终止| D
-    S[降级管理器<br/>DegradationManager] -->|资源紧张| B
+    C -->|节点本地数据| D[节点本地采集器<br/>NodeLocalCollector]
+    C -->|集群补充数据| E[集群补充采集器<br/>ClusterSupplementCollector]
+    C -->|跳过采集| F[跳过记录器<br/>SkipLogger]
+    
+    D -->|采集结果| G[数据聚合器<br/>DataAggregator]
+    E -->|采集结果| G
+    F -->|跳过原因| G
+    
+    G -->|按检查项分组| H[上报客户端<br/>ReporterClient]
+    H -->|HTTP POST| I[监控服务端]
+    
+    J[配置文件监控<br/>FileWatcher] -->|1秒内检测| A
+    K[时间调度器<br/>FixedIntervalScheduler] -->|固定周期| B
+    L[资源监控器<br/>ResourceMonitor] -->|CPU/内存限制| M[资源限制器<br/>ResourceLimiter]
+    M -->|降级策略| B
+    N[超时保护器<br/>TimeoutManager] -->|强制终止| D
+    O[降级管理器<br/>DegradationManager] -->|资源紧张| B
 ```
 
 ### 架构原则
-1. **节点本地执行**：所有检查命令在节点本地执行，不访问apiserver
+1. **节点本地执行**：所有检查命令在节点本地执行，**完全不依赖apiserver**
 2. **配置驱动**：所有行为由配置文件精确控制，支持热更新
 3. **最小内存**：顺序处理，避免并发，时间换空间
 4. **解耦设计**：检查项定义与数据采集功能完全分离
 5. **固定周期**：严格按照配置周期执行，不受资源影响
-6. **数据去重**：智能识别apiserver已提供数据，避免重复采集
+6. **数据分类**：基于数据范围模式智能识别节点本地独有数据
 7. **资源保护**：严格的资源使用限制和降级机制
 
 ## 组件设计
@@ -63,118 +60,318 @@ type ConfigManager struct {
 }
 
 type Config struct {
-    Version      string        `json:"version"`      // 配置版本
-    Checks       []CheckConfig `json:"checks"`       // 仅包含启用的检查项
+    Version        string        `json:"version"`          // 配置版本
+    Checks         []CheckConfig `json:"checks"`           // 仅包含启用的检查项
     ResourceLimits ResourceLimits `json:"resource_limits"`
-    APIServerDedup APIServerDedupConfig `json:"apiserver_dedup"`
-    Reporter     ReporterConfig `json:"reporter"`
+    DataScope      DataScopeConfig `json:"data_scope"`      // 数据范围配置
+    Reporter       ReporterConfig `json:"reporter"`
 }
 
 type CheckConfig struct {
-    Name        string        `json:"name"`         // 检查项名称
-    Interval    time.Duration `json:"interval"`     // 固定周期：1-60分钟
-    Collectors  []string      `json:"collectors"`   // 引用的采集功能ID
-    Params      map[string]interface{} `json:"params"` // 采集参数
-    Mode        string        `json:"mode"`         // "local_only", "apiserver_only", "auto"
-    Enabled     bool          `json:"enabled"`      // 启用/禁用开关
-    Timeout     time.Duration `json:"timeout"`      // 检查超时时间
-    Priority    int           `json:"priority"`     // 优先级（资源紧张时低优先级先降级）
+    Name        string        `json:"name"`              // 检查项名称
+    Interval    time.Duration `json:"interval"`          // 固定周期：1-60分钟
+    Collectors  []string      `json:"collectors"`        // 引用的采集功能ID
+    Params      map[string]interface{} `json:"params"`     // 采集参数
+    Mode        string        `json:"mode"`              // "仅本地", "集群补充", "自动选择"
+    Enabled     bool          `json:"enabled"`           // 启用/禁用开关
+    Timeout     time.Duration `json:"timeout"`           // 检查超时时间
+    Priority    int           `json:"priority"`          // 优先级（资源紧张时低优先级先降级）
 }
 
 type ResourceLimits struct {
-    MaxCPU        float64 `json:"max_cpu_percent"` // 最大CPU使用率：5%
-    MaxMemory     int64   `json:"max_memory_mb"`   // 最大内存使用：100MB
-    MinInterval   time.Duration `json:"min_interval"` // 最小检查间隔：5分钟
-    MaxConcurrent int     `json:"max_concurrent"`  // 最大并发检查数：1（顺序执行）
+    MaxCPU        float64       `json:"max_cpu_percent"`   // 最大CPU使用率：5%
+    MaxMemory     int64         `json:"max_memory_mb"`     // 最大内存使用：100MB
+    MinInterval   time.Duration `json:"min_interval"`      // 最小检查间隔：1分钟
+    MaxConcurrent int           `json:"max_concurrent"`    // 最大并发检查数：1（顺序执行）
 }
 
-type APIServerDedupConfig struct {
-    Enabled        bool     `json:"enabled"`
-    MetricsWhitelist []string `json:"metrics_whitelist"` // apiserver已覆盖的指标列表
-    Timeout        time.Duration `json:"timeout"` // apiserver检查超时：2s
-    FallbackLocal  bool     `json:"fallback_local"` // apiserver失败时回退到本地
+type DataScopeConfig struct {
+    Mode           string   `json:"mode"`                // "仅本地", "集群补充", "自动选择"
+    NodeLocalTypes []string `json:"node_local_types"`    // 节点本地独有数据类型
+    SupplementTypes []string `json:"supplement_types"`   // 集群补充数据类型
+    SkipTypes      []string `json:"skip_types"`          // 跳过采集的数据类型
 }
 
 type ReporterConfig struct {
-    Endpoint    string        `json:"endpoint"`     // 上报端点
-    Timeout     time.Duration `json:"timeout"`      // 上报超时
-    MaxRetries  int           `json:"max_retries"`  // 最大重试次数
-    RetryDelay  time.Duration `json:"retry_delay"`  // 重试延迟
-    Compression bool          `json:"compression"`  // 是否压缩数据
+    Endpoint    string        `json:"endpoint"`          // 上报端点
+    Timeout     time.Duration `json:"timeout"`           // 上报超时
+    MaxRetries  int           `json:"max_retries"`       // 最大重试次数
+    RetryDelay  time.Duration `json:"retry_delay"`       // 重试延迟
+    Compression bool          `json:"compression"`       // 是否压缩数据
 }
 ```
 
-### 2. apiserver数据去重检查器 (APIServerDedupChecker)
+### 2. 数据范围检查器 (DataScopeChecker)
+
+根据需求17，实现**完全不依赖apiserver**的数据范围检查机制：
+
 ```go
-type APIServerDedupChecker struct {
-    client       *http.Client
-    whitelist    map[string]bool // apiserver已覆盖的指标集合
-    cache        *lru.Cache     // 缓存去重结果
-    lastUpdate   time.Time
-    updateMutex  sync.RWMutex
+type DataScopeChecker struct {
+    nodeLocalTypes   map[string]bool // 节点本地独有数据类型
+    supplementTypes  map[string]bool // 集群补充数据类型
+    skipTypes        map[string]bool // 跳过采集的数据类型
+    cache            *lru.Cache      // 缓存数据类型分类结果
+    lastUpdate       time.Time
+    updateMutex      sync.RWMutex
+    mode             string          // 当前模式：仅本地、集群补充、自动选择
 }
 
-type DedupResult struct {
+type ScopeCheckResult struct {
     ShouldCollect bool   // 是否需要在本地采集
-    Reason        string // 采集或跳过的原因
-    Source        string // 数据来源：apiserver/local
+    Reason        string // 采集或跳过的详细原因
+    Source        string // 数据来源：local/supplement/skipped
+    Mode          string // 当前使用的模式
+    DataType      string // 数据类型分类
 }
 
-func (d *APIServerDedupChecker) ShouldCollectLocally(
+// 三种采集模式的完整实现（完全不依赖apiserver）
+func (d *DataScopeChecker) ShouldCollectLocally(
     checkName string, 
     collectors []string,
     mode string,
-) (*DedupResult, error) {
-    // 根据模式决定采集策略
+) (*ScopeCheckResult, error) {
+    // 根据需求17的三种模式进行精确控制
     switch mode {
-    case "local_only":
-        return &DedupResult{
-            ShouldCollect: true,
-            Reason: "forced local collection",
-            Source: "local",
-        }, nil
-    case "apiserver_only":
-        return &DedupResult{
-            ShouldCollect: false,
-            Reason: "forced apiserver collection",
-            Source: "apiserver",
-        }, nil
-    case "auto":
-        return d.checkAutoMode(checkName, collectors)
+    case "仅本地":
+        // 仅采集节点本地独有数据（严格模式）
+        return d.handleLocalOnlyMode(checkName, collectors)
+    case "集群补充":
+        // 仅采集集群监控无法提供的细节数据
+        return d.handleClusterSupplementMode(checkName, collectors)
+    case "自动选择":
+        // 基于预定义的数据类型映射自动判断
+        return d.handleAutoSelectMode(checkName, collectors)
     default:
-        return nil, fmt.Errorf("invalid collection mode: %s", mode)
+        return nil, fmt.Errorf("invalid collection mode: %s, must be one of: 仅本地, 集群补充, 自动选择", mode)
     }
 }
 
-func (d *APIServerDedupChecker) checkAutoMode(
+func (d *DataScopeChecker) handleLocalOnlyMode(
     checkName string, 
     collectors []string,
-) (*DedupResult, error) {
-    // 检查缓存
-    if cached, ok := d.cache.Get(checkName); ok {
-        return cached.(*DedupResult), nil
-    }
-    
-    // 检查apiserver是否已提供对应数据
+) (*ScopeCheckResult, error) {
+    // 严格验证所有采集器必须是节点本地独有
     for _, collector := range collectors {
-        if d.whitelist[collector] {
-            result := &DedupResult{
+        if !d.isNodeLocalOnly(collector) {
+            return &ScopeCheckResult{
                 ShouldCollect: false,
-                Reason: fmt.Sprintf("collector %s covered by apiserver", collector),
-                Source: "apiserver",
-            }
-            d.cache.Add(checkName, result)
-            return result, nil
+                Reason: fmt.Sprintf("collector %s is not node-local-only data, rejected in 仅本地 mode", collector),
+                Source: "skipped",
+                Mode:   "仅本地",
+                DataType: "cluster_level",
+            }, nil
         }
     }
     
-    result := &DedupResult{
+    return &ScopeCheckResult{
         ShouldCollect: true,
-        Reason: "local only data",
+        Reason: "forced local collection for node-local-only data",
         Source: "local",
+        Mode:   "仅本地",
+        DataType: "node_local",
+    }, nil
+}
+
+func (d *DataScopeChecker) handleClusterSupplementMode(
+    checkName string, 
+    collectors []string,
+) (*ScopeCheckResult, error) {
+    // 仅采集集群监控无法提供的细节数据
+    supplementCollectors := []string{}
+    
+    for _, collector := range collectors {
+        if d.isClusterSupplementData(collector) {
+            supplementCollectors = append(supplementCollectors, collector)
+        }
     }
-    d.cache.Add(checkName, result)
+    
+    if len(supplementCollectors) > 0 {
+        return &ScopeCheckResult{
+            ShouldCollect: true,
+            Reason: fmt.Sprintf("collecting %d cluster-supplement collectors: %v", 
+                len(supplementCollectors), supplementCollectors),
+            Source: "supplement",
+            Mode:   "集群补充",
+            DataType: "cluster_supplement",
+        }, nil
+    }
+    
+    return &ScopeCheckResult{
+        ShouldCollect: false,
+        Reason: "no cluster-supplement data to collect",
+        Source: "skipped",
+        Mode:   "集群补充",
+        DataType: "cluster_level",
+    }, nil
+}
+
+func (d *DataScopeChecker) handleAutoSelectMode(
+    checkName string, 
+    collectors []string,
+) (*ScopeCheckResult, error) {
+    // 检查缓存
+    cacheKey := fmt.Sprintf("%s:%s", checkName, strings.Join(collectors, ","))
+    if cached, ok := d.cache.Get(cacheKey); ok {
+        return cached.(*ScopeCheckResult), nil
+    }
+    
+    // 基于预定义的数据类型映射进行智能判断
+    nodeLocalCollectors := []string{}
+    supplementCollectors := []string{}
+    
+    for _, collector := range collectors {
+        if d.isNodeLocalOnly(collector) {
+            nodeLocalCollectors = append(nodeLocalCollectors, collector)
+        } else if d.isClusterSupplementData(collector) {
+            supplementCollectors = append(supplementCollectors, collector)
+        } else if d.isClusterLevel(collector) {
+            // 集群级数据，跳过本地采集
+            continue
+        } else {
+            // 未知类型，默认作为节点本地处理
+            nodeLocalCollectors = append(nodeLocalCollectors, collector)
+        }
+    }
+    
+    // 优先采集节点本地独有数据
+    if len(nodeLocalCollectors) > 0 {
+        result := &ScopeCheckResult{
+            ShouldCollect: true,
+            Reason: fmt.Sprintf("collecting %d node-local-only collectors: %v", 
+                len(nodeLocalCollectors), nodeLocalCollectors),
+            Source: "local",
+            Mode:   "自动选择",
+            DataType: "node_local",
+        }
+        d.cache.Add(cacheKey, result)
+        return result, nil
+    }
+    
+    // 其次采集集群补充数据
+    if len(supplementCollectors) > 0 {
+        result := &ScopeCheckResult{
+            ShouldCollect: true,
+            Reason: fmt.Sprintf("collecting %d cluster-supplement collectors: %v", 
+                len(supplementCollectors), supplementCollectors),
+            Source: "supplement",
+            Mode:   "自动选择",
+            DataType: "cluster_supplement",
+        }
+        d.cache.Add(cacheKey, result)
+        return result, nil
+    }
+    
+    // 无可采集数据
+    result := &ScopeCheckResult{
+        ShouldCollect: false,
+        Reason: "no node-local data to collect",
+        Source: "skipped",
+        Mode:   "自动选择",
+        DataType: "cluster_level",
+    }
+    d.cache.Add(cacheKey, result)
     return result, nil
+}
+
+// 节点本地独有数据类型判断（基于需求17）
+func (d *DataScopeChecker) isNodeLocalOnly(collector string) bool {
+    nodeLocalTypes := map[string]bool{
+        // CPU相关 - 仅节点本地可见
+        "cpu_throttling":     true,
+        "cpu_temperature":    true,
+        "cpu_frequency":      true,
+        "cpu_cache_misses":   true,
+        "cpu_context_switches": true,
+        
+        // 内存相关 - 仅节点本地可见
+        "memory_fragmentation": true,
+        "swap_usage":         true,
+        "oom_events":         true,
+        "memory_page_faults": true,
+        "memory_compaction":  true,
+        
+        // 磁盘相关 - 仅节点本地可见
+        "disk_smart":         true,
+        "disk_errors":        true,
+        "disk_performance":   true,
+        "disk_temperature":   true,
+        "disk_reallocated_sectors": true,
+        
+        // 网络相关 - 仅节点本地可见
+        "network_interface_errors": true,
+        "tcp_retransmit_rate": true,
+        "network_buffer_usage": true,
+        "network_dropped_packets": true,
+        "network_collisions": true,
+        
+        // K8s组件本地状态 - 仅节点本地可见
+        "kubelet_process":    true,
+        "kubelet_logs":       true,
+        "kubelet_cert":       true,
+        "containerd_status":  true,
+        "containerd_memory":  true,
+        "containerd_logs":    true,
+        "cni_plugin_status":  true,
+        "kube_proxy_iptables": true,
+        
+        // 系统级 - 仅节点本地可见
+        "system_load":        true,
+        "file_descriptors":   true,
+        "kernel_logs":        true,
+        "ntp_sync":           true,
+        "process_restarts":   true,
+        
+        // 安全相关 - 仅节点本地可见
+        "cert_validity":      true,
+        "file_permissions":   true,
+        "audit_logs":         true,
+        "suid_files":         true,
+    }
+    
+    return nodeLocalTypes[collector]
+}
+
+// 集群补充数据类型判断
+func (d *DataScopeChecker) isClusterSupplementData(collector string) bool {
+    supplementTypes := map[string]bool{
+        // 进程级资源使用（集群监控无法提供）
+        "process_cpu_usage":      true,
+        "process_memory_usage":   true,
+        "process_file_descriptors": true,
+        
+        // 内核日志和事件
+        "kernel_dmesg":           true,
+        "kernel_oom_events":      true,
+        "kernel_panic_logs":      true,
+        
+        // 本地配置文件状态
+        "kubelet_config_status":  true,
+        "containerd_config_status": true,
+        "cni_config_status":      true,
+        
+        // 证书有效期（本地检查）
+        "kubelet_cert_validity":  true,
+        "containerd_cert_validity": true,
+        "etcd_cert_validity":     true,
+    }
+    
+    return supplementTypes[collector]
+}
+
+// 集群级数据类型判断（仅用于拒绝）
+func (d *DataScopeChecker) isClusterLevel(collector string) bool {
+    clusterTypes := map[string]bool{
+        "node_cpu_usage":     true,
+        "node_memory_usage":  true,
+        "node_disk_io":       true,
+        "node_network_bytes": true,
+        "pod_cpu_usage":      true,
+        "pod_memory_usage":   true,
+        "container_cpu":      true,
+        "container_memory":   true,
+    }
+    
+    return clusterTypes[collector]
 }
 ```
 
@@ -183,7 +380,7 @@ func (d *APIServerDedupChecker) checkAutoMode(
 type CheckScheduler struct {
     checks       map[string]*ScheduledCheck
     trigger      chan string // 检查项触发通道
-    dedupChecker *APIServerDedupChecker
+    scopeChecker *DataScopeChecker
     collectorMgr *CollectorManager
     resourceMgr  *ResourceManager
     ctx          context.Context
@@ -237,8 +434,8 @@ func (s *CheckScheduler) executeCheck(check *ScheduledCheck) {
         return
     }
     
-    // 检查apiserver去重
-    dedupResult, err := s.dedupChecker.ShouldCollectLocally(
+    // 检查数据范围
+    scopeResult, err := s.scopeChecker.ShouldCollectLocally(
         check.config.Name,
         check.config.Collectors,
         check.config.Mode,
@@ -248,8 +445,8 @@ func (s *CheckScheduler) executeCheck(check *ScheduledCheck) {
         return
     }
     
-    if !dedupResult.ShouldCollect {
-        check.skipReason = dedupResult.Reason
+    if !scopeResult.ShouldCollect {
+        check.skipReason = scopeResult.Reason
         return
     }
     
@@ -545,7 +742,7 @@ func (t *TimeoutManager) getTimeout(checkName string) time.Duration {
     {
       "name": "node_cpu_local",
       "interval": "5m",
-      "mode": "local_only",
+      "mode": "仅本地",
       "collectors": ["cpu_throttling", "cpu_temperature", "cpu_frequency"],
       "params": {
         "temperature_threshold": 80,
@@ -558,7 +755,7 @@ func (t *TimeoutManager) getTimeout(checkName string) time.Duration {
     {
       "name": "kubelet_health",
       "interval": "1m",
-      "mode": "auto",
+      "mode": "自动选择",
       "collectors": ["kubelet_process", "kubelet_logs", "kubelet_cert"],
       "params": {
         "log_level": "error",
@@ -567,37 +764,19 @@ func (t *TimeoutManager) getTimeout(checkName string) time.Duration {
       "enabled": true,
       "timeout": "15s",
       "priority": 2
-    },
-    {
-      "name": "container_runtime_local",
-      "interval": "10m",
-      "mode": "local_only",
-      "collectors": ["containerd_status", "containerd_memory", "containerd_logs"],
-      "params": {
-        "memory_threshold_mb": 500,
-        "log_patterns": ["error", "warning"]
-      },
-      "enabled": true,
-      "timeout": "45s",
-      "priority": 3
     }
   ],
   "resource_limits": {
     "max_cpu_percent": 5,
     "max_memory_mb": 100,
-    "min_interval": "5m",
+    "min_interval": "1m",
     "max_concurrent": 1
   },
-  "apiserver_dedup": {
-    "enabled": true,
-    "metrics_whitelist": [
-      "node_cpu_usage_total",
-      "node_memory_usage_bytes",
-      "node_disk_io_time_seconds_total",
-      "node_network_receive_bytes_total"
-    ],
-    "timeout": "2s",
-    "fallback_local": true
+  "data_scope": {
+    "mode": "自动选择",
+    "node_local_types": ["cpu_throttling", "cpu_temperature", "memory_fragmentation"],
+    "supplement_types": ["process_cpu_usage", "kernel_dmesg"],
+    "skip_types": ["node_cpu_usage", "node_memory_usage"]
   },
   "reporter": {
     "endpoint": "http://monitoring-service:8080/api/v1/diagnostics",
@@ -670,6 +849,109 @@ var checkToCollectors = map[string][]string{
 }
 ```
 
+### 数据类型白名单详细定义
+
+根据需求17，提供完整的数据类型映射：
+
+```go
+// 节点本地独有数据类型定义（需求17要求）
+var NodeLocalDataTypeMapping = map[string]DataTypeInfo{
+    // CPU类 - 仅节点本地可见
+    "cpu_throttling": {
+        Category:    "cpu",
+        Type:        "node_local",
+        Description: "CPU throttling事件详情、CPU温度、CPU频率变化",
+        Examples:    []string{"cpu_throttle_events", "cpu_temperature_celsius", "cpu_frequency_mhz"},
+    },
+    
+    // 内存类 - 仅节点本地可见
+    "memory_fragmentation": {
+        Category:    "memory",
+        Type:        "node_local",
+        Description: "内存碎片指标、swap使用率、OOM killer事件详情",
+        Examples:    []string{"memory_fragmentation_ratio", "swap_usage_percent", "oom_killer_events"},
+    },
+    
+    // 磁盘类 - 仅节点本地可见
+    "disk_smart": {
+        Category:    "disk",
+        Type:        "node_local",
+        Description: "磁盘I/O延迟分布、磁盘错误日志、SMART状态",
+        Examples:    []string{"disk_io_latency_ms", "disk_smart_status", "disk_error_count"},
+    },
+    
+    // 网络类 - 仅节点本地可见
+    "network_interface_errors": {
+        Category:    "network",
+        Type:        "node_local",
+        Description: "网络接口错误统计、TCP重传率、网络缓冲区状态",
+        Examples:    []string{"network_interface_errors", "tcp_retransmit_rate", "network_buffer_usage"},
+    },
+    
+    // K8s组件本地状态
+    "kubelet_local": {
+        Category:    "kubernetes",
+        Type:        "node_local",
+        Description: "kubelet进程状态、kubelet日志错误、kubelet配置文件完整性、kubelet证书有效期",
+        Examples:    []string{"kubelet_process_status", "kubelet_log_errors", "kubelet_cert_expiry_days"},
+    },
+    
+    // 容器运行时本地状态
+    "container_runtime_local": {
+        Category:    "container_runtime",
+        Type:        "node_local",
+        Description: "containerd/docker进程状态、运行时socket响应时间、运行时日志错误、运行时内存使用",
+        Examples:    []string{"containerd_memory_mb", "containerd_socket_latency_ms", "containerd_log_errors"},
+    },
+    
+    // 系统级本地状态
+    "system_local": {
+        Category:    "system",
+        Type:        "node_local",
+        Description: "系统负载平均值、文件描述符使用率、关键系统进程状态、内核错误日志",
+        Examples:    []string{"system_load_average", "file_descriptors_usage", "kernel_log_errors"},
+    },
+}
+
+// 集群级数据类型定义（apiserver已覆盖）
+var ClusterLevelDataTypeMapping = map[string]DataTypeInfo{
+    "node_cpu_usage": {
+        Category:    "cpu",
+        Type:        "cluster_level",
+        Description: "节点CPU使用率（apiserver已提供）",
+        Examples:    []string{"node_cpu_usage_total", "node_cpu_usage_percent"},
+    },
+    
+    "node_memory_usage": {
+        Category:    "memory",
+        Type:        "cluster_level",
+        Description: "节点内存使用率（apiserver已提供）",
+        Examples:    []string{"node_memory_usage_bytes", "node_memory_usage_percent"},
+    },
+    
+    "node_disk_io": {
+        Category:    "disk",
+        Type:        "cluster_level",
+        Description: "节点磁盘I/O统计（apiserver已提供）",
+        Examples:    []string{"node_disk_io_time_seconds_total", "node_disk_read_bytes_total"},
+    },
+    
+    "node_network_bytes": {
+        Category:    "network",
+        Type:        "cluster_level",
+        Description: "节点网络流量统计（apiserver已提供）",
+        Examples:    []string{"node_network_receive_bytes_total", "node_network_transmit_bytes_total"},
+    },
+}
+
+type DataTypeInfo struct {
+    Category    string   `json:"category"`
+    Type        string   `json:"type"` // "node_local" 或 "cluster_level"
+    Description string   `json:"description"`
+    Examples    []string `json:"examples"`
+}
+```
+
 ## 轻量级设计策略
 
 ### 1. 内存优化
@@ -706,7 +988,7 @@ func (p *MemoryPool) PutBuffer(buf *bytes.Buffer) {
 - **时间片调度**：使用time.Ticker精确控制采集间隔
 - **避免忙等待**：sleep而非轮询
 - **复用采集结果**：同一采集功能结果被多个检查项共享
-- **智能跳过**：apiserver已覆盖的检查项直接跳过
+- **智能跳过**：集群级数据直接跳过
 - **批处理**：合并多个相似操作，减少系统调用
 
 ```go
@@ -815,7 +1097,7 @@ func (d *DegradationManager) Degrade() {
 {
   "name": "custom_security_check",
   "interval": "10m",
-  "mode": "local_only",
+  "mode": "仅本地",
   "collectors": ["file_permissions", "suid_files", "audit_logs"],
   "params": {
     "sensitive_paths": ["/etc/kubernetes", "/var/lib/kubelet"],
@@ -1007,32 +1289,6 @@ func (h *ReporterErrorHandler) HandleReportError(
 }
 ```
 
-### 4. apiserver连接错误
-- **连接失败**：自动回退到节点本地检查
-- **认证失败**：标记apiserver检查为不可用
-- **超时处理**：快速失败，避免阻塞本地检查
-
-```go
-type APIServerErrorHandler struct {
-    logger      *zap.Logger
-    unavailable bool
-    lastCheck   time.Time
-}
-
-func (h *APIServerErrorHandler) HandleAPIServerError(err error) {
-    h.logger.Error("apiserver error", zap.Error(err))
-    
-    // 标记apiserver为不可用
-    h.unavailable = true
-    h.lastCheck = time.Now()
-    
-    // 5分钟后重试
-    time.AfterFunc(5*time.Minute, func() {
-        h.checkAPIServerHealth()
-    })
-}
-```
-
 ## 测试策略
 
 ### 1. 单元测试
@@ -1079,7 +1335,7 @@ func TestConfigParser(t *testing.T) {
 - **配置热更新**：验证配置变更的1秒内响应
 - **固定周期测试**：验证采集周期的精确性
 - **错误恢复**：模拟各种错误场景的恢复能力
-- **apiserver去重**：验证数据去重逻辑的正确性
+- **数据范围模式**：验证三种模式的正确切换
 
 ```go
 // 集成测试示例
@@ -1193,3 +1449,229 @@ func TestPermissionHandling(t *testing.T) {
 - **资源使用**：CPU、内存使用率告警
 - **检查失败**：检查项失败次数告警
 - **配置错误**：配置加载失败告警
+
+## 时序图
+
+### 1. 系统初始化时序图
+```mermaid
+sequenceDiagram
+    participant Main as 主程序
+    participant ConfigManager as 配置管理器
+    participant CheckScheduler as 检查项调度器
+    participant DataScopeChecker as 数据范围检查器
+    participant DataTypeMapper as 数据类型映射器
+    participant CollectorManager as 数据采集器管理器
+    participant ReporterClient as 上报客户端
+    
+    Main->>ConfigManager: 启动配置管理器
+    ConfigManager->>ConfigManager: 加载初始配置
+    ConfigManager->>CheckScheduler: 传递配置（包含模式设置）
+    CheckScheduler->>DataScopeChecker: 初始化数据范围检查器
+    DataScopeChecker->>DataTypeMapper: 加载数据类型白名单
+    DataTypeMapper->>DataTypeMapper: 初始化节点本地/集群级映射
+    DataTypeMapper-->>DataScopeChecker: 返回映射配置
+    CheckScheduler->>CollectorManager: 初始化采集器管理器
+    CollectorManager->>CollectorManager: 注册节点本地采集器
+    CheckScheduler->>ReporterClient: 初始化上报客户端
+    Main->>CheckScheduler: 启动检查调度
+    CheckScheduler->>CheckScheduler: 为每个检查项创建定时器
+    CheckScheduler->>CheckScheduler: 根据模式配置调度策略
+```
+
+### 2. 单次检查执行时序图
+```mermaid
+sequenceDiagram
+    participant Timer as 定时器
+    participant CheckScheduler as 检查调度器
+    participant ResourceManager as 资源管理器
+    participant DataScopeChecker as 数据范围检查器
+    participant CollectorManager as 数据采集器管理器
+    participant DataAggregator as 数据聚合器
+    participant ReporterClient as 上报客户端
+    
+    Timer->>CheckScheduler: 触发检查
+    CheckScheduler->>ResourceManager: 检查资源限制
+    alt 资源充足
+        ResourceManager-->>CheckScheduler: 允许执行
+        CheckScheduler->>DataScopeChecker: 检查采集模式
+        
+        alt 模式 = "仅本地"
+            DataScopeChecker->>DataScopeChecker: 验证所有采集器为节点本地独有
+            alt 验证通过
+                DataScopeChecker-->>CheckScheduler: 强制本地采集
+                CheckScheduler->>CollectorManager: 执行本地采集
+                CollectorManager-->>CheckScheduler: 返回本地数据
+            else 验证失败
+                DataScopeChecker-->>CheckScheduler: 跳过采集（非节点本地数据）
+                CheckScheduler->>CheckScheduler: 记录跳过原因
+            end
+            
+        else 模式 = "集群补充"
+            DataScopeChecker-->>CheckScheduler: 跳过所有本地采集
+            CheckScheduler->>CheckScheduler: 记录跳过原因
+            
+        else 模式 = "自动选择"
+            DataScopeChecker->>Cache: 查询数据类型缓存
+            alt 缓存未命中
+                DataScopeChecker->>DataScopeChecker: 基于预定义映射判断
+                DataScopeChecker->>Cache: 更新缓存
+            end
+            
+            DataScopeChecker->>DataScopeChecker: 智能判断数据类型
+            alt 节点本地独有数据
+                DataScopeChecker-->>CheckScheduler: 执行本地采集
+                CheckScheduler->>CollectorManager: 执行本地采集
+                CollectorManager-->>CheckScheduler: 返回本地数据
+            else 集群级数据（apiserver已覆盖）
+                DataScopeChecker-->>CheckScheduler: 跳过采集
+                CheckScheduler->>CheckScheduler: 记录跳过原因
+            end
+        end
+        
+        alt 需要本地采集
+            CheckScheduler->>DataAggregator: 聚合数据
+            DataAggregator->>DataAggregator: 按检查项分组
+            DataAggregator-->>ReporterClient: 发送聚合数据
+            ReporterClient->>MonitoringService: HTTP POST上报
+            MonitoringService-->>ReporterClient: 返回响应
+            ReporterClient-->>CheckScheduler: 上报完成
+        end
+        
+    else 资源紧张
+        ResourceManager-->>CheckScheduler: 拒绝执行
+        CheckScheduler->>CheckScheduler: 记录跳过原因
+    end
+```
+
+### 3. 配置热更新时序图
+```mermaid
+sequenceDiagram
+    participant FileWatcher as 文件监控器
+    participant ConfigManager as 配置管理器
+    participant CheckScheduler as 检查调度器
+    participant CollectorManager as 数据采集器管理器
+    
+    FileWatcher->>ConfigManager: 检测到配置文件变更
+    ConfigManager->>ConfigManager: 重新加载配置
+    alt 配置有效
+        ConfigManager->>CheckScheduler: 推送新配置
+        CheckScheduler->>CheckScheduler: 停止旧定时器
+        CheckScheduler->>CheckScheduler: 创建新定时器
+        CheckScheduler->>CollectorManager: 更新采集器配置
+        CollectorManager->>CollectorManager: 重新注册采集器
+        CheckScheduler-->>ConfigManager: 配置更新完成
+    else 配置无效
+        ConfigManager->>ConfigManager: 记录错误日志
+        ConfigManager-->>FileWatcher: 保持旧配置
+    end
+```
+
+### 4. 资源限制和降级时序图
+```mermaid
+sequenceDiagram
+    participant ResourceMonitor as 资源监控器
+    participant ResourceManager as 资源管理器
+    participant CheckScheduler as 检查调度器
+    participant Throttler as 限流器
+    
+    loop 每10秒
+        ResourceMonitor->>ResourceMonitor: 获取CPU和内存使用率
+        ResourceMonitor->>ResourceManager: 报告资源使用情况
+    end
+    
+    alt CPU使用率 > 5%
+        ResourceManager->>Throttler: 触发CPU限流
+        Throttler->>CheckScheduler: 延长检查间隔
+        CheckScheduler->>CheckScheduler: 调整定时器
+    else 内存使用率 > 100MB
+        ResourceManager->>Throttler: 触发内存限流
+        Throttler->>CheckScheduler: 跳过低优先级检查
+        CheckScheduler->>CheckScheduler: 暂停低优先级检查
+    end
+    
+    loop 每5分钟
+        ResourceManager->>ResourceManager: 检查资源恢复
+        alt 资源恢复正常
+            ResourceManager->>Throttler: 解除限流
+            Throttler->>CheckScheduler: 恢复正常调度
+            CheckScheduler->>CheckScheduler: 恢复所有检查
+        end
+    end
+```
+
+### 5. 错误处理和重试时序图
+```mermaid
+sequenceDiagram
+    participant CheckScheduler as 检查调度器
+    participant CollectorManager as 数据采集器管理器
+    participant ReporterClient as 上报客户端
+    participant ErrorHandler as 错误处理器
+    participant RetryCache as 重试缓存
+    
+    CheckScheduler->>CollectorManager: 执行数据采集
+    alt 采集失败
+        CollectorManager->>ErrorHandler: 报告采集错误
+        ErrorHandler->>ErrorHandler: 记录错误日志
+        ErrorHandler->>CheckScheduler: 建议重试策略
+        CheckScheduler->>CheckScheduler: 根据策略重试
+    else 采集成功
+        CheckScheduler->>ReporterClient: 上报数据
+        alt 上报失败
+            ReporterClient->>ErrorHandler: 报告上报错误
+            ErrorHandler->>RetryCache: 缓存失败数据
+            ErrorHandler->>ReporterClient: 设置指数退避重试
+            ReporterClient->>ReporterClient: 延迟重试
+            loop 重试直到成功
+                ReporterClient->>MonitoringService: 重试上报
+                alt 成功
+                    MonitoringService-->>ReporterClient: 成功响应
+                    ReporterClient->>RetryCache: 清除缓存
+                else 失败
+                    ReporterClient->>ErrorHandler: 增加退避时间
+                end
+            end
+        else 上报成功
+            ReporterClient-->>CheckScheduler: 上报完成
+        end
+    end
+```
+
+### 6. 数据范围模式完整流程时序图
+```mermaid
+sequenceDiagram
+    participant User as 用户配置
+    participant ConfigManager as 配置管理器
+    participant CheckScheduler as 检查调度器
+    participant DataScopeChecker as 数据范围检查器
+    participant DataTypeValidator as 数据类型验证器
+    
+    User->>ConfigManager: 设置检查项模式
+    ConfigManager->>CheckScheduler: 传递模式配置
+    
+    loop 每次检查执行
+        CheckScheduler->>DataScopeChecker: 执行模式决策
+        
+        alt 模式 = "仅本地"
+            DataScopeChecker->>DataTypeValidator: 验证采集器类型
+            DataTypeValidator->>DataTypeValidator: 检查白名单
+            DataTypeValidator-->>DataScopeChecker: 返回验证结果
+            DataScopeChecker-->>CheckScheduler: 仅采集节点本地数据
+            
+        else 模式 = "集群补充"
+            DataScopeChecker->>DataTypeValidator: 验证集群补充数据
+            DataTypeValidator->>DataTypeValidator: 检查补充数据白名单
+            DataTypeValidator-->>DataScopeChecker: 返回验证结果
+            DataScopeChecker-->>CheckScheduler: 仅采集集群补充数据
+            
+        else 模式 = "自动选择"
+            DataScopeChecker->>DataTypeValidator: 智能分类
+            DataTypeValidator->>DataTypeValidator: 根据白名单映射
+            DataTypeValidator-->>DataScopeChecker: 返回分类结果
+            DataScopeChecker-->>CheckScheduler: 智能选择采集源
+        end
+        
+        CheckScheduler->>CheckScheduler: 执行相应操作
+    end
+```
+
+这些时序图与架构图和组件设计相互补充，帮助理解系统的运行时行为和各个组件之间的交互关系，确保与需求文档中的17个需求完全一致。

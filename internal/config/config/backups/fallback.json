@@ -1,0 +1,58 @@
+{
+  "version": "1.0",
+  "checks": [
+    {
+      "name": "node_health",
+      "interval": 300000000000,
+      "collectors": [
+        "cpu",
+        "memory",
+        "disk"
+      ],
+      "params": {
+        "cpu_threshold": 80,
+        "memory_threshold": 90
+      },
+      "mode": "自动选择",
+      "enabled": true,
+      "timeout": 30000000000,
+      "priority": 1
+    }
+  ],
+  "resource_limits": {
+    "max_cpu_percent": 5,
+    "max_memory_mb": 100,
+    "min_interval": 60000000000,
+    "max_concurrent": 1
+  },
+  "data_scope": {
+    "mode": "自动选择",
+    "node_local_types": [
+      "cpu_throttling",
+      "cpu_temperature",
+      "memory_fragmentation",
+      "disk_smart",
+      "network_interface_errors",
+      "kubelet_process"
+    ],
+    "supplement_types": [
+      "process_cpu_usage",
+      "kernel_dmesg",
+      "cert_validity"
+    ],
+    "skip_types": [
+      "node_cpu_usage",
+      "node_memory_usage",
+      "node_disk_io"
+    ]
+  },
+  "reporter": {
+    "endpoint": "http://localhost:8080/api/v1/diagnostics",
+    "timeout": 10000000000,
+    "max_retries": 3,
+    "retry_delay": 5000000000,
+    "compression": true,
+    "cache_max_size": 104857600,
+    "cache_max_age": 86400000000000
+  }
+}

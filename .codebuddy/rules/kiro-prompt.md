@@ -75,7 +75,7 @@ Shell: zsh
 
 
 # Platform-Specific Command Guidelines
-Commands MUST be adapted to your Linux system running on darwin with zsh shell.
+Commands MUST be adapted to your Linux system with zsh shell.
 
 
 # Platform-Specific Command Examples
